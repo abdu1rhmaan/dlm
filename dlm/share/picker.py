@@ -40,76 +40,49 @@ def _try_termux_picker() -> Tuple[bool, str]:
     However, if 'termux-api' is installed, 'termux-storage-get' opens a picker and returns the file path.
     This is the preferred way on Termux.
     """
-    if not shutil.which("termux-storage-get"):
-        return False, ""
-        
-    try:
-        # termux-storage-get copies the selected file to a specific path? 
-        # No, it "Requests a file from the system and outputs to the specified file."
-        # Usage: termux-storage-get output-file
-        
-        # We need a temp location
-        tmp_dir = Path.home() / ".dlm" / "share_tmp"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        target_file = tmp_dir / "picked_file"
-        
-        # This command blocks until user picks a file
-        result = subprocess.run(
-            ["termux-storage-get", str(target_file)], 
-            capture_output=True
-        )
-        
-        if result.returncode == 0 and target_file.exists() and target_file.stat().st_size > 0:
-            # The file is COPIED here. We return this path.
-            # Ideally we want the original path to avoid copy, but Android SAF (Storage Access Framework)
-            # doesn't give direct paths easily. Copying is safe.
-            # But wait, 'dlm share' likely wants to just READ.
-            # But termux-storage-get output is the only way to get the content.
-            # We must rename it to preserve extension if possible? 
-            # termux-storage-get doesn't tell us the original name :(
-            # That's a limitation.
-            
-            # Let's try 'termux-file-editor' approach? No, that's for "Share -> Termux".
-            
-            # For Phase 1, if we use termux-storage-get, we lose the filename unless we ask user.
-            # Fallback: Let's stick to manual path for now if termux-storage-get is weak.
-            # OR: usage of 'am' with a custom intent is complex.
-            
-            # Re-reading prompt: 
-            # "Attempt to open Android system file picker using intent: am start ... Capture returned content URI"
-            # This implies the user *thinks* we can capture it. 
-            # In standard shell, 'am start' returns immediately.
-            # Without a resident Java helper, we can't get the result Intent.
-            
-            # BEST EFFORT: Check for 'termux-dialog file' (part of termux-api widget)? 
-            # 'termux-dialog file' is a thing! 
-            # Let's try that first.
-            pass
-        
-        # Try termux-dialog file
-        if shutil.which("termux-dialog"):
-            # termux-dialog file
-            # Output: JSON with 'text' field containing path? No, 'code' and 'text'.
+    # Priority 1: termux-dialog file (Native Picker - Returns Path)
+    if shutil.which("termux-dialog"):
+        try:
             res = subprocess.run(
                 ["termux-dialog", "file"], 
                 capture_output=True, 
-                text=True
+                text=True,
+                timeout=15 # Prevents eternal freeze if API hangs
             )
-            # Output format: {"code":0, "text":"/storage/emulated/0/Download/foo.mp4"}
-            # This only works if Termux has storage permission and can see the file.
             import json
-            try:
-                data = json.loads(res.stdout)
-                if data.get("code") == -1: # Cancelled
-                    return True, "" # Gui worked but cancelled
-                if data.get("code") == 0 and data.get("text"):
-                    return True, data["text"]
-            except:
-                pass
+            data = json.loads(res.stdout)
+            if data.get("code") == 0 and data.get("text"):
+                return True, data["text"].strip()
+            elif data.get("code") == -1:
+                return True, "" # User Cancelled explicitly
+        except subprocess.TimeoutExpired:
+            print("⚠️  Android picker timed out.")
+        except Exception:
+            pass
 
-        return False, ""
-    except Exception:
-        return False, ""
+    # Priority 2: termux-storage-get (Copies file - Fallback)
+    if shutil.which("termux-storage-get"):
+        try:
+            tmp_dir = Path.home() / ".dlm" / "share_tmp"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            target_file = tmp_dir / "picked_file"
+            
+            # This copies content. It is heavy.
+            # Timeout is crucial here.
+            subprocess.run(
+                ["termux-storage-get", str(target_file)], 
+                capture_output=True,
+                timeout=15
+            )
+            
+            if target_file.exists() and target_file.stat().st_size > 0:
+                return True, str(target_file)
+        except subprocess.TimeoutExpired:
+            print("⚠️  Storage picker timed out.")
+        except Exception:
+            pass
+
+    return False, ""
 
 def _try_ranger_picker() -> Tuple[bool, str]:
     """Attempt to use ranger console file manager."""
