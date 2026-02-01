@@ -115,6 +115,20 @@ class DeleteFolder(Command):
 class RemoveBrowserDownload(Command):
     id: int
 
+@dataclass
+class RegisterExternalTask(Command):
+    filename: str
+    total_size: int
+    source: str = "upload" # 'upload' or 'download'
+    state: str = "DOWNLOADING"
+
+@dataclass
+class UpdateExternalTask(Command):
+    id: str
+    downloaded_bytes: int
+    speed: float = 0.0
+    state: str = None # Optional state update
+
 
 
 # --- Bus ---
