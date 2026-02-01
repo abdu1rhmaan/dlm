@@ -2716,8 +2716,20 @@ class DownloadService:
     def get_download(self, download_id: str) -> Optional[Download]:
         # Return in-memory state if active, otherwise from DB
         with self._lock:
+            # Check ephemeral first
+            if download_id in self._ephemeral_memory:
+                return self._ephemeral_memory[download_id]
             if download_id in self._active_downloads:
                 return self._active_downloads[download_id]
+
+    def get_all_downloads(self, include_ephemeral: bool = False):
+        """Get all downloads, optionally including in-memory ephemeral ones."""
+        dls = self.repository.get_all()
+        if include_ephemeral:
+            # Merge ephemeral tasks
+            ephemeral_list = list(self._ephemeral_memory.values())
+            dls.extend(ephemeral_list)
+        return dls
         return self.repository.get(download_id)
 
     def import_from_manifest(self, manifest_path: str, parts_filter: list = None, as_separate_tasks: bool = False, folder_id: int = None, target_id: int = None) -> str:
