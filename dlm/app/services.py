@@ -867,12 +867,14 @@ class DownloadService:
             if download_id in self._discovery_tasks: return
             
             # 1.5 Concurrency Check
-            # If we are already at capacity, let it stay in WAITING/QUEUED/DEQUE
-            if self._get_active_count() >= self.concurrency_limit:
-                if dl.state != DownloadState.WAITING:
-                    dl.state = DownloadState.WAITING
-                    self.repository.save(dl)
-                return
+            # [SHARE-FIX] Bypass concurrency limit for share tasks (ephemeral, time-sensitive)
+            if dl.source != 'share':
+                # If we are already at capacity, let it stay in WAITING/QUEUED/DEQUE
+                if self._get_active_count() >= self.concurrency_limit:
+                    if dl.state != DownloadState.WAITING:
+                        dl.state = DownloadState.WAITING
+                        self.repository.save(dl)
+                    return
 
         # 2. Resource Discovery if size unknown
         if dl.total_size == 0 and dl.source in [None, 'browser']:

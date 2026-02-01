@@ -111,7 +111,16 @@ class ShareClient:
             
             if dl_id:
                 # print(f"🚀 Initializing download (ID: {dl_id})...") # Reduced noise
+                from dlm.app.commands import StartDownload
                 self.bus.handle(StartDownload(id=dl_id))
+                
+                # [SHARE-FIX] Force queue processing to start immediately
+                try:
+                    from dlm.app.commands import ProcessQueue
+                    self.bus.handle(ProcessQueue())
+                except:
+                    pass  # ProcessQueue might not exist in older versions
+                
                 return dl_id
             else:
                 print("❌ Failed to queue download.")

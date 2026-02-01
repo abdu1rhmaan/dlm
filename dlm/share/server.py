@@ -272,13 +272,33 @@ class ShareServer:
         self.run_server()
 
     def _get_local_ip(self):
+        """Get the actual LAN IP address, with Termux compatibility."""
         try:
-            # Connect to a public DNS to get the preferred outgoing IP
+            # Method 1: Try psutil (most reliable for Termux)
+            try:
+                import psutil
+                for interface, addrs in psutil.net_if_addrs().items():
+                    for addr in addrs:
+                        if addr.family == 2:  # AF_INET (IPv4)
+                            ip = addr.address
+                            # Skip loopback and look for 192.168.x.x or 10.x.x.x
+                            if ip.startswith('192.168.') or ip.startswith('10.'):
+                                return ip
+            except ImportError:
+                pass
+            
+            # Method 2: Socket trick (fallback)
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
             ip = s.getsockname()[0]
             s.close()
-            return ip
+            
+            # Validate it's a LAN IP
+            if ip.startswith('192.168.') or ip.startswith('10.') or ip.startswith('172.'):
+                return ip
+            
+            # Method 3: Hostname resolution
+            return socket.gethostbyname(socket.gethostname())
         except:
             return "127.0.0.1"
 
