@@ -654,7 +654,8 @@ class DownloadService:
     def add_download(self, url: str, source: str=None, media_type: str=None, quality: str=None, 
                      cut_range: str=None, conversion_required: bool=False, title: str=None, duration: float=None,
                      audio_mode: str=None, vocals_gpu: bool=False, vocals_keep_all: bool=False, referer: str=None, storage_state: str=None, 
-                     torrent_files: list=None, torrent_file_offset: int=0, total_size: int=0, folder_id: int=None, **kwargs) -> str:
+                     torrent_files: list=None, torrent_file_offset: int=0, total_size: int=0, folder_id: int=None, 
+                     output_template: str = None, rename_template: str = None, ephemeral: bool = False, **kwargs) -> str:
         """Add a download to the queue without starting it."""
         
         # CRITICAL: Prevent task creation inside workspace
