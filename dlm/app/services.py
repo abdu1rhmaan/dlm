@@ -703,7 +703,7 @@ class DownloadService:
 
         if source in ['youtube', 'spotify']:
             res_meta = {'title': title, 'index': kwargs.get('index', 1), 'source': source, 'id': dl.id}
-            target_folder, target_stem = resolve_target_path(kwargs.get('output_template'), kwargs.get('rename_template'), res_meta)
+            target_folder, target_stem = resolve_target_path(output_template or kwargs.get('output_template'), rename_template or kwargs.get('rename_template'), res_meta)
             ext = ".mp3" if media_type == 'audio' else ".mp4"
             dl.target_filename = f"{target_stem}{ext}"
             final_folder = target_folder if target_folder.is_absolute() else self.download_dir / target_folder
@@ -718,7 +718,7 @@ class DownloadService:
             vid_id = re.search(r'/video/(\d+)', url).group(1) if re.search(r'/video/(\d+)', url) else dl.id[:8]
             tiktok_stem = f"{username}_{vid_id}" if username else vid_id
             res_meta = {'title': title or tiktok_stem, 'index': kwargs.get('index', 1), 'source': source, 'id': vid_id}
-            target_folder, target_stem = resolve_target_path(kwargs.get('output_template'), kwargs.get('rename_template'), res_meta)
+            target_folder, target_stem = resolve_target_path(output_template or kwargs.get('output_template'), rename_template or kwargs.get('rename_template'), res_meta)
             if not kwargs.get('rename_template'): target_stem = sanitize_folder_name(tiktok_stem)
             ext = ".mp3" if media_type == 'audio' else ".mp4"
             dl.target_filename = f"{target_stem}{ext}"
@@ -742,7 +742,7 @@ class DownloadService:
             
             # Resolve Target Path/Filename similar to other sources
             res_meta = {'title': title, 'index': kwargs.get('index', 1), 'source': source or 'http', 'id': dl.id}
-            target_folder, target_stem = resolve_target_path(kwargs.get('output_template'), kwargs.get('rename_template'), res_meta)
+            target_folder, target_stem = resolve_target_path(output_template or kwargs.get('output_template'), rename_template or kwargs.get('rename_template'), res_meta)
             
             # Determine filename
             if title:
