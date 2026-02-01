@@ -724,12 +724,13 @@ class DLMShell(cmd.Cmd):
                 pass
 
         class MockArgs:
-            share_action = action
-            save_to = save_to
+            def __init__(self):
+                self.share_action = action
+                self.save_to = save_to
 
         from dlm.share.cli import handle_share_command
         try:
-             handle_share_command(MockArgs, self.bus)
+             handle_share_command(MockArgs(), self.bus)
         except Exception as e:
              print(f"Error: {e}")
 
