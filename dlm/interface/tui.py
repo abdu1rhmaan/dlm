@@ -187,20 +187,28 @@ class TUI:
         
         # Title Block
         prefix = f"[#{d.get('index', '?')}] "
-        name_cap = int(term_width * 0.40)
-        effective_max = min(max_name_len, name_cap)
-        if effective_max < 16: effective_max = 16
+        # Format: [#X]Filename | ━━━━━━━━ | Status | Size
+        # Reserve space for: prefix(len) + separator(3) + stats(len) + separator(3) + 2(bar edges)
+        # We need to allocate remaining space between Name and Bar.
+        # Strategy: Give Bar 40% of remaining, Name 60%? 
+        # User wants "Full Line Bar". So let's prioritize Bar.
+        # Give Name max 20 chars. rest to Bar.
         
-        short_title = filename if len(filename) <= effective_max else self._truncate_middle(filename, effective_max)
-        title_block = short_title.ljust(effective_max)
+        reserved_static = len(prefix) + 3 + len(stats_part) + 3
+        available = term_width - reserved_static
+        if available < 10: available = 10
         
-        # Bar: Pink/Cyan Filling, ╸ Black Accent, Match-181818 Track
-        # Calculate bar width dynamically based on available space
-        # Format: [#X] Filename | ━━━━━━━━━━━━━━━ | Status | Size
-        # Reserve space for: prefix (8) + title (effective_max) + separators (6) + stats (len(stats_part))
-        reserved = 8 + effective_max + 6 + len(stats_part)
-        available_for_bar = max(10, term_width - reserved)  # Minimum 10 chars for bar
-        bar_width = min(available_for_bar, 30)  # Cap at 30 for aesthetics
+        name_width = min(available // 3, 25) # Max 25 chars for name
+        if name_width < 8: name_width = 8
+        
+        bar_width = available - name_width
+        
+        # Recalculate truncation with new name_width
+        short_title = filename if len(filename) <= name_width else self._truncate_middle(filename, name_width)
+        title_block = short_title.ljust(name_width)
+        
+        # Render Bar
+        bar_width = max(5, bar_width)
         
         try: pct = float(progress_str.replace('%',''))
         except: pct = 0.0

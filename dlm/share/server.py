@@ -31,8 +31,8 @@ class ShareServer:
         self.connected_clients = set()
         
         # Add Middleware for Progress
-        if self.bus and self.upload_task_id:
-            self.app.middleware("http")(self.progress_middleware)
+        # Add Middleware for Progress (Always on for share)
+        self.app.middleware("http")(self.progress_middleware)
             
         self._setup_routes()
 
@@ -40,7 +40,7 @@ class ShareServer:
         response = await call_next(request)
         
         # Check if it's the download route
-        if "download" in request.url.path and self.upload_task_id:
+        if "download" in request.url.path:
              # Wrap the streaming response
              async def wrapped_iterator(original_iterator):
                  import time
@@ -96,12 +96,16 @@ class ShareServer:
         self._last_bytes_measure = bytes_sent
         self._last_time_measure = now
         
-        from dlm.app.commands import UpdateExternalTask
-        self.bus.handle(UpdateExternalTask(
-            id=self.upload_task_id,
-            downloaded_bytes=bytes_sent,
-            speed=speed
-        ))
+        # Expose speed for local monitoring
+        self.current_speed = speed
+
+        if self.bus and self.upload_task_id:
+            from dlm.app.commands import UpdateExternalTask
+            self.bus.handle(UpdateExternalTask(
+                id=self.upload_task_id,
+                downloaded_bytes=bytes_sent,
+                speed=speed
+            ))
 
     def _setup_routes(self):
         # 1. Auth Endpoint

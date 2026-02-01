@@ -17,6 +17,8 @@ def handle_share_command(args, bus):
     else:
         print("Usage: share -send | share -rec")
 def _do_send(bus):
+    import time
+    
     # 1. Pick File
     file_path = pick_file()
     if not file_path:
@@ -28,34 +30,22 @@ def _do_send(bus):
         print(f"Error preparing file: {e}")
         return
 
-    # 2. Register Upload Task
-    from dlm.app.commands import RegisterExternalTask
-    upload_id = bus.handle(RegisterExternalTask(
-        filename=entry.name,
-        total_size=entry.size_bytes,
-        source="upload",
-        state="WAITING"
-    ))
-
-    # 3. Start Server (Background)
-    server = ShareServer(entry, bus=bus, upload_task_id=upload_id)
+    # 2. Start Server (Background, No DB Task)
+    # We do NOT register an external task.
+    server = ShareServer(entry, bus=bus, upload_task_id=None)
     info = server.prepare()
     
     import threading
     t = threading.Thread(target=server.run_server, daemon=True)
     t.start()
     
-    # 4. TUI Monitor (Blocking)
+    # 3. TUI Monitor (Standalone Loop)
     from dlm.interface.tui import TUI
     tui = TUI(bus)
     
-    # Header Info
-    # Header Info Callback
     def get_header():
-        # Check active clients
         clients = list(getattr(server, 'connected_clients', []))
         status_line = f"Clients: \033[1;32m{len(clients)} Connected\033[0m" if clients else "Clients: \033[1;31mWaiting...\033[0m"
-        
         return [
             f"\033[1;32m[ SHARE SENDER ]\033[0m",
             f"File:  {entry.name}",
@@ -66,17 +56,60 @@ def _do_send(bus):
             status_line,
             ""
         ]
-    
+
     try:
-        tui.monitor_task(upload_id, custom_header=get_header)
+        # Clear screen
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
+        
+        while True:
+            # Poll Server State
+            bytes_sent = getattr(server, '_bytes_sent', 0)
+            speed = getattr(server, 'current_speed', 0.0)
+            total = entry.size_bytes
+            
+            # Dynamic State
+            state = "WAITING"
+            if len(server.connected_clients) > 0:
+                if bytes_sent >= total:
+                    state = "COMPLETED"
+                else:
+                    state = "DOWNLOADING"
+            
+            # Calculate Progress
+            pct = (bytes_sent / total * 100) if total > 0 else 0.0
+            
+            # Ephemeral Task Dict for TUI Renderer
+            fake_task = {
+                'index': 1,
+                'id': 'share-sender',
+                'filename': entry.name,
+                'state': state,
+                'progress': f"{pct:.1f}%",
+                'downloaded': bytes_sent,
+                'total': total,
+                'speed': speed
+            }
+            
+            # Max name length calculation
+            max_len = len(entry.name)
+            
+            # Render
+            header = get_header()
+            tui._render_active_tasks([fake_task], max_len, custom_header=header)
+            
+            if state == "COMPLETED":
+                 # Wait a moment then exit? Or keep showing?
+                 # User usually wants to know it sent successfully.
+                 # Let's keep showing "COMPLETED" until Ctrl+C
+                 pass
+
+            time.sleep(0.2)
+            
     except KeyboardInterrupt:
-        pass
-    
-    # Cleanup? Thread is daemon, will die on exit. 
-    # But usually good to signal stop.
-    # ShareServer doesn't have stop() yet exposed cleanly for thread. 
-    # Uvicorn handles signal.
-    # For now, daemon thread exit is fine.
+        # Clear screen on exit
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
 
 def _do_receive(args, bus):
     # 1. Ask for details
