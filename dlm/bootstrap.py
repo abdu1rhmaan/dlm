@@ -104,7 +104,6 @@ def create_container() -> dict:
             torrent_file_offset=cmd.torrent_file_offset,
             total_size=cmd.total_size,
             folder_id=cmd.folder_id,
-            folder_id=cmd.folder_id,
             output_template=cmd.output_template,
             rename_template=cmd.rename_template,
             ephemeral=cmd.ephemeral

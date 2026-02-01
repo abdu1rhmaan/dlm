@@ -121,17 +121,18 @@ def pick_file() -> Optional[str]:
     picked_via_gui = False
     
     if is_termux():
-        print("📱 Launching Android file picker...")
-        success, path = _try_termux_picker()
+        # User requested ranger as default/only option ("ala tool ranger")
+        print("�️  Launching Ranger (Console Picker)...")
+        success, path = _try_ranger_picker()
         if success:
             picked_via_gui = True
         else:
-            print("⚠️  Android picker failed/missing. Trying ranger...")
-            success, path = _try_ranger_picker()
+            print("⚠️  Ranger not found or cancelled. Trying Android native picker...")
+            success, path = _try_termux_picker()
             if success:
                 picked_via_gui = True
             else:
-                 print("⚠️  ranger not found. Falling back to manual input.")
+                 print("⚠️  Native picker failed. Falling back to manual input.")
     else:
         print("🖥️  Launching System file picker...")
         success, path = _try_tkinter_picker()
