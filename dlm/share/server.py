@@ -153,9 +153,7 @@ class ShareServer:
             with self._lock:
                 self.connected_clients.add(client_ip)
 
-            # Allow auth via Query param 'token' if header is missing (for dlm engine integration)
-            if not session_id:
-                if token and self.auth_manager.validate_session(token):
+
             # Explicitly set Content-Length to ensure receiver can see it
             headers = {
                 "Content-Length": str(self.file_entry.size_bytes),
