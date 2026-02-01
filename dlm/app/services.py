@@ -726,10 +726,15 @@ class DownloadService:
             self.repository.save(dl)
             return dl.id
 
-        # Step 2: Standard HTTP
-        # Step 2: Standard HTTP
-        try:
-            dl.total_size = self.network.get_content_length(url, referer=dl.referer)
+            # Step 2: Standard HTTP
+            if total_size > 0:
+                 dl.total_size = total_size
+                 dl.resumable = True # Assume resumable if we have explicit size (implied safe source)
+            else:
+                 try:
+                     dl.total_size = self.network.get_content_length(url, referer=dl.referer)
+                 except: 
+                     dl.total_size = 0
             
             # Resolve Target Path/Filename similar to other sources
             res_meta = {'title': title, 'index': kwargs.get('index', 1), 'source': source or 'http', 'id': dl.id}
@@ -752,7 +757,8 @@ class DownloadService:
             final_folder.mkdir(parents=True, exist_ok=True)
             dl.output_path = str(final_folder) if kwargs.get('output_template') else None
 
-            dl.resumable = self.network.supports_ranges(url, referer=dl.referer)
+            if not dl.resumable:
+                dl.resumable = self.network.supports_ranges(url, referer=dl.referer)
             self._initialize_segments(dl)
             dl.state = DownloadState.QUEUED
             self.repository.save(dl)
@@ -2439,6 +2445,11 @@ class DownloadService:
                         dl.segments.append(Segment(0, 0))
                     dl.segments[0].downloaded_bytes += len(chunk)
                     downloaded_count += len(chunk)
+            
+            # [FIX] Enforce Strict Completion if Size Known
+            if dl.total_size and dl.total_size > 0:
+                if downloaded_count != dl.total_size:
+                     raise Exception(f"Incomplete transfer: Expected {dl.total_size}, got {downloaded_count}")
             
             # Post-stream safety check:
             # If we downloaded very small amount (e.g. < 200KB) and total size is still 0, 

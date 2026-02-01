@@ -82,22 +82,25 @@ class ShareServer:
             return
         self._last_update = now
         
-        # Calculate speed? Simple implementation: Let DLM handle speed if we send bytes?
-        # UpdateExternalTask takes speed.
-        # We need to track speed.
-        # Simple diff:
-        # self._bytes_sent / (now - start)? No, instantaneous.
-        # Let's just send bytes for now. DLM TUI might calculate speed from delta if it was polling.
-        # But here we are pushing updates.
-        # UpdateExternalTask handler just saves.
-        # So we should calculate speed here.
-        # TODO: Better speed calc. For now 0.
+        # Calculate speed
+        if not hasattr(self, '_last_bytes_measure'):
+             self._last_bytes_measure = 0
+             self._last_time_measure = now
+        
+        speed = 0.0
+        time_diff = now - self._last_time_measure
+        if time_diff > 0:
+            bytes_diff = bytes_sent - self._last_bytes_measure
+            speed = bytes_diff / time_diff
+        
+        self._last_bytes_measure = bytes_sent
+        self._last_time_measure = now
         
         from dlm.app.commands import UpdateExternalTask
         self.bus.handle(UpdateExternalTask(
             id=self.upload_task_id,
             downloaded_bytes=bytes_sent,
-            speed=0.0 # Placeholder
+            speed=speed
         ))
 
     def _setup_routes(self):
