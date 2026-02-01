@@ -708,7 +708,7 @@ class DownloadService:
             dl.target_filename = f"{target_stem}{ext}"
             final_folder = target_folder if target_folder.is_absolute() else self.download_dir / target_folder
             final_folder.mkdir(parents=True, exist_ok=True)
-            dl.output_path = str(final_folder) if kwargs.get('output_template') else None
+            dl.output_path = str(final_folder) if (output_template or kwargs.get('output_template')) else None
             dl.state = DownloadState.QUEUED
             self.repository.save(dl)
             return dl.id
@@ -724,7 +724,7 @@ class DownloadService:
             dl.target_filename = f"{target_stem}{ext}"
             final_folder = target_folder if target_folder.is_absolute() else self.download_dir / target_folder
             final_folder.mkdir(parents=True, exist_ok=True)
-            dl.output_path = str(final_folder) if kwargs.get('output_template') else None
+            dl.output_path = str(final_folder) if (output_template or kwargs.get('output_template')) else None
             dl.state = DownloadState.QUEUED
             self.repository.save(dl)
             return dl.id
@@ -759,7 +759,7 @@ class DownloadService:
             # Set output path
             final_folder = target_folder if target_folder.is_absolute() else self.download_dir / target_folder
             final_folder.mkdir(parents=True, exist_ok=True)
-            dl.output_path = str(final_folder) if kwargs.get('output_template') else None
+            dl.output_path = str(final_folder) if (output_template or kwargs.get('output_template')) else None
 
             if not dl.resumable:
                 dl.resumable = self.network.supports_ranges(url, referer=dl.referer)

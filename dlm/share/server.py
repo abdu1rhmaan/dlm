@@ -6,7 +6,6 @@ import socket
 import threading
 from typing import Optional
 import os
-import sys
 
 from .models import Room, FileEntry
 from .auth import AuthManager
@@ -107,10 +106,6 @@ class ShareServer:
                 downloaded_bytes=bytes_sent,
                 speed=speed
             ))
-
-        # [SENDER LOG] Live feedback
-        sys.stdout.write(f"\rSent: {self._format_size(bytes_sent)}   Speed: {speed/1024/1024:.2f} MB/s   ")
-        sys.stdout.flush()
 
     def _setup_routes(self):
         # 1. Auth Endpoint
