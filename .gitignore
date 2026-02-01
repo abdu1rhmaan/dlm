@@ -1,7 +1,13 @@
-# Python build / packaging
-*.egg-info/
+# Runtime database
+dlm.db
+
+# Python cache
 __pycache__/
 *.pyc
-.env
-.venv
-dlm.db
+
+# Packaging artifacts
+*.egg-info/
+
+# Virtual env (لو موجود)
+.venv/
+venv/
