@@ -1,0 +1,42 @@
+Metadata-Version: 2.4
+Name: dlm
+Version: 0.1.0
+Summary: A professional CLI/TUI Download Manager
+Author: CompuMark
+Requires-Python: >=3.7
+Description-Content-Type: text/markdown
+Requires-Dist: yt-dlp
+Requires-Dist: requests
+Requires-Dist: python-dotenv
+Requires-Dist: colorama
+Requires-Dist: fastapi
+Requires-Dist: uvicorn
+Requires-Dist: cryptography
+Requires-Dist: curl_cffi
+Requires-Dist: tk
+Requires-Dist: libtorrent
+Requires-Dist: numpy<2
+Requires-Dist: torch
+Requires-Dist: torchaudio==2.1.0
+Requires-Dist: demucs==4.0.0
+Requires-Dist: soundfile
+Provides-Extra: desktop
+Requires-Dist: cryptography; extra == "desktop"
+Requires-Dist: curl_cffi; extra == "desktop"
+Requires-Dist: tk; extra == "desktop"
+Requires-Dist: libtorrent; extra == "desktop"
+Requires-Dist: numpy<2; extra == "desktop"
+Requires-Dist: torch; extra == "desktop"
+Requires-Dist: torchaudio==2.1.0; extra == "desktop"
+Requires-Dist: demucs==4.0.0; extra == "desktop"
+Requires-Dist: soundfile; extra == "desktop"
+Provides-Extra: torrent
+Requires-Dist: libtorrent; extra == "torrent"
+Provides-Extra: vocals
+Requires-Dist: numpy<2; extra == "vocals"
+Requires-Dist: torch; extra == "vocals"
+Requires-Dist: torchaudio==2.1.0; extra == "vocals"
+Requires-Dist: demucs==4.0.0; extra == "vocals"
+Requires-Dist: soundfile; extra == "vocals"
+Dynamic: provides-extra
+Dynamic: requires-dist
