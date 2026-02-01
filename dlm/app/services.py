@@ -2549,6 +2549,20 @@ class DownloadService:
     def _finalize_download(self, dl: Download):
         """Assembles segments if necessary and triggers cleanup."""
         try:
+            # [CRITICAL] Wait for all worker threads to release file handles (Windows Locking)
+            if hasattr(dl, '_futures') and dl._futures:
+                from concurrent.futures import wait
+                # Filter out done futures? wait() handles it.
+                # But if WE are running inside a future (e.g. via submit), we shouldn't wait for ourselves?
+                # _finalize_download is called by monitor (thread) or _try_rebalance (worker).
+                # If called by worker, it might be in dl._futures.
+                # However, usually _stream_worker finishes then we finalize.
+                # Monitor calls it. Monitor is NOT in _futures.
+                try:
+                    wait(dl._futures, timeout=30)
+                except Exception:
+                    pass
+
             # --- V2 Workspace Logic ---
             if dl.task_id:
                 # This is a workspace part task.

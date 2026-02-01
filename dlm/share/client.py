@@ -84,9 +84,10 @@ class ShareClient:
             print(f"\nFound file: {target_file['name']}")
             print(f"Size: {target_file['size_bytes']} bytes")
             
-            if input("Download this file? [Y/n] ").lower() == 'n':
-                print("Aborted.")
-                return
+            # Auto-accept for dlm share unified flow
+            # if input("Download this file? [Y/n] ").lower() == 'n':
+            #     print("Aborted.")
+            #     return
 
             # 3. Add to DLM Engine
             download_url = f"{self.base_url}/download/{target_file['file_id']}"
@@ -103,10 +104,12 @@ class ShareClient:
             dl_id = self.bus.handle(AddDownload(url=final_url, output_template=output_template, title=target_file['name']))
             
             if dl_id:
-                print(f"🚀 Initializing download (ID: {dl_id})...")
+                # print(f"🚀 Initializing download (ID: {dl_id})...") # Reduced noise
                 self.bus.handle(StartDownload(id=dl_id))
+                return dl_id
             else:
                 print("❌ Failed to queue download.")
+                return None
 
         except requests.exceptions.ConnectionError:
             print("❌ Could not connect to sender. Check IP/Port and Firewall.")

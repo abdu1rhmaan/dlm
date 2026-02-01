@@ -9,8 +9,8 @@ import json
 import os
 from typing import Optional, Dict, Any
 
-from dlm.app.commands import CommandBus, AddDownload, ListDownloads, StartDownload, PauseDownload, ResumeDownload, RemoveDownload, RetryDownload, SplitDownload, ImportDownload, VocalsCommand, BrowserCommand, PromoteBrowserDownload, RecaptureDownload, CreateFolder, MoveTask, DeleteFolder, RemoveBrowserDownload
-from dlm.core.entities import DownloadState
+from dlm.app.commands import CommandBus, AddDownload, ListDownloads, StartDownload, PauseDownload, ResumeDownload, RemoveDownload, RetryDownload, SplitDownload, ImportDownload, VocalsCommand, BrowserCommand, PromoteBrowserDownload, RecaptureDownload, CreateFolder, MoveTask, DeleteFolder, RemoveBrowserDownload, RegisterExternalTask, UpdateExternalTask
+from dlm.core.entities import DownloadState, Download
 
 def get_project_root() -> Path:
     """Get the project root directory (where dlm package is located)."""
@@ -572,13 +572,50 @@ def create_container() -> dict:
                 raise ValueError("Folder not empty. Use --force to delete recursively.")
         
         # Recursive deletion logic in service would be better, but let's do a simple one here if force
+        #Recursive deletion logic in service would be better, but let's do a simple one here if force
         if cmd.force:
             service.delete_folder_recursively(cmd.folder_id)
         else:
             repo.delete_folder(cmd.folder_id)
 
+    def handle_register_external_task(cmd: RegisterExternalTask):
+        import uuid
+        import datetime
+        
+        # Determine state
+        state_enum = DownloadState.DOWNLOADING
+        if cmd.state == "INITIALIZING": state_enum = DownloadState.INITIALIZING
+        elif cmd.state == "WAITING": state_enum = DownloadState.WAITING
+
+        d = Download(
+            url="external://transfer", 
+            id=str(uuid.uuid4()),
+            target_filename=cmd.filename, 
+            total_size=cmd.total_size, 
+            state=state_enum,
+            source=cmd.source
+        )
+        repo.save(d)
+        _rebuild_index_mapping(repo)
+        return d.id
+
+    def handle_update_external_task(cmd: UpdateExternalTask):
+        d = repo.get(cmd.id)
+        if d:
+            # Update basic stats
+            d._downloaded_bytes_override = cmd.downloaded_bytes
+            d.speed_bps = cmd.speed
+            if cmd.state:
+                if cmd.state == "COMPLETED": d.state = DownloadState.COMPLETED
+                elif cmd.state == "FAILED": d.state = DownloadState.FAILED
+                # ... others as needed
+            repo.save(d)
+
+
     # 5. Bus
     bus = CommandBus()
+    bus.register(RegisterExternalTask, handle_register_external_task)
+    bus.register(UpdateExternalTask, handle_update_external_task)
     bus.register(AddDownload, handle_add_download)
     bus.register(ListDownloads, handle_list_downloads)
     bus.register(StartDownload, handle_start_download)

@@ -65,11 +65,59 @@ class TUI:
                 self._render_active_tasks(display_list, max_name_len)
                 time.sleep(0.25)
         except KeyboardInterrupt:
+            # Clear screen on exit
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
             return True 
 
-    def _render_active_tasks(self, downloads, max_name_len):
+    def monitor_task(self, task_id: str, custom_header: list = None):
+        """Monitor a specific task until completion or Ctrl+C."""
+        # Initial clear
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
+        
+        try:
+            while True:
+                all_downloads = self.bus.handle(ListDownloads(recursive=True))
+                # Filter for our task
+                target = next((d for d in all_downloads if d['id'] == task_id), None)
+                
+                if not target:
+                    print("Task not found or removed.")
+                    break
+                
+                # Check completion
+                if target['state'] in ['COMPLETED', 'FAILED', 'CANCELLED']:
+                    # Final Render
+                    self._render_active_tasks([target], len(target.get('filename','')), custom_header=custom_header)
+                    
+                    msg = f"Task {target['state']}."
+                    if target['state'] == 'FAILED':
+                         err = target.get('error', 'Unknown Error')
+                         msg += f" Reason: {err}"
+                         print(f"\n\033[1;31m{msg}\033[0m")
+                    else:
+                         print(f"\n{msg} Press Ctrl+C to exit.")
+                    
+                    time.sleep(1)
+                    continue
+
+                # Render
+                self._render_active_tasks([target], len(target.get('filename','')), custom_header=custom_header)
+                time.sleep(0.25)
+        except KeyboardInterrupt:
+            # Clear screen
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
+            return True 
+
+    def _render_active_tasks(self, downloads, max_name_len, custom_header: list = None):
         term_width = shutil.get_terminal_size((80, 20)).columns
-        output = ["\033[H", "\033[1;36m[ DLM MONITOR ]\033[0m | Press Ctrl+C to return to shell\n", "─" * min(term_width, 60) + "\033[K\n"]
+        
+        if custom_header:
+             output = ["\033[H"] + [f"{line}\033[K\n" for line in custom_header] + ["─" * min(term_width, 60) + "\033[K\n"]
+        else:
+             output = ["\033[H", "\033[1;36m[ DLM MONITOR ]\033[0m | Press Ctrl+C to return to shell\n", "─" * min(term_width, 60) + "\033[K\n"]
 
         if not downloads:
             output.append("\nNo active downloads.\033[K\n")

@@ -11,7 +11,7 @@ from .models import Room, FileEntry
 from .auth import AuthManager
 
 class ShareServer:
-    def __init__(self, file_entry: FileEntry, port: int = 0):
+    def __init__(self, file_entry: FileEntry, port: int = 0, bus=None, upload_task_id: str = None):
         self.app = FastAPI(title="dlm-share")
         self.auth_manager = AuthManager()
         self.file_entry = file_entry
@@ -20,8 +20,82 @@ class ShareServer:
         self.host = "0.0.0.0"
         self._server_thread = None
         self._server = None
+        self.bus = bus
+        self.upload_task_id = upload_task_id
         
+        self._bytes_sent = 0
+        self._lock = threading.Lock()
+        self._last_update = 0
+        
+        # Add Middleware for Progress
+        if self.bus and self.upload_task_id:
+            self.app.middleware("http")(self.progress_middleware)
+            
         self._setup_routes()
+
+    async def progress_middleware(self, request: Request, call_next):
+        response = await call_next(request)
+        
+        # Check if it's the download route
+        if "download" in request.url.path and self.upload_task_id:
+             # Wrap the streaming response
+             async def wrapped_iterator(original_iterator):
+                 import time
+                 try:
+                     async for chunk in original_iterator:
+                         yield chunk
+                         with self._lock:
+                             self._bytes_sent += len(chunk)
+                             current_bytes = self._bytes_sent
+                         
+                         # Throttled update (every 0.5s or so?)
+                         # Or just fire-and-forget? Bus overhead?
+                         # Let's fire every 100KB or something.
+                         # Better: Check time.
+                        #  now = time.time()
+                        #  if now - self._last_update > 0.5:
+                        #      self._last_update = now
+                        #      self._update_dlm(current_bytes)
+                         # Actually, let's just update. The TUI polls. Repo updates are fast enough?
+                         # 10MB/s = 1000 updates/s if 10KB chunks. Too fast.
+                         # Update logic:
+                         self._update_dlm_throttled(current_bytes)
+                         
+                 except Exception:
+                     # Connection dropped?
+                     pass
+             
+             # Modify response body
+             # Starlette StreamingResponse / FileResponse uses .body_iterator for async
+             if hasattr(response, 'body_iterator'):
+                 response.body_iterator = wrapped_iterator(response.body_iterator)
+        
+        return response
+
+    def _update_dlm_throttled(self, bytes_sent):
+        import time
+        now = time.time()
+        if now - self._last_update < 0.2: # Max 5 updates/sec
+            return
+        self._last_update = now
+        
+        # Calculate speed? Simple implementation: Let DLM handle speed if we send bytes?
+        # UpdateExternalTask takes speed.
+        # We need to track speed.
+        # Simple diff:
+        # self._bytes_sent / (now - start)? No, instantaneous.
+        # Let's just send bytes for now. DLM TUI might calculate speed from delta if it was polling.
+        # But here we are pushing updates.
+        # UpdateExternalTask handler just saves.
+        # So we should calculate speed here.
+        # TODO: Better speed calc. For now 0.
+        
+        from dlm.app.commands import UpdateExternalTask
+        self.bus.handle(UpdateExternalTask(
+            id=self.upload_task_id,
+            downloaded_bytes=bytes_sent,
+            speed=0.0 # Placeholder
+        ))
 
     def _setup_routes(self):
         # 1. Auth Endpoint
@@ -96,6 +170,14 @@ class ShareServer:
             
             def on_complete():
                 print(f"[INFO] Transfer completed: {self.file_entry.name}")
+                # Mark Complete in DLM Task
+                if self.bus and self.upload_task_id:
+                    from dlm.app.commands import UpdateExternalTask
+                    self.bus.handle(UpdateExternalTask(
+                        id=self.upload_task_id,
+                        downloaded_bytes=self.file_entry.size_bytes,
+                        state="COMPLETED"
+                    ))
 
             return FileResponse(
                 path, 
@@ -104,12 +186,12 @@ class ShareServer:
                 background=BackgroundTask(on_complete)
             )
 
-    def start(self):
-        """Start server and block until stopped (or run in thread)."""
+    def prepare(self):
+        """Prepare server (bind port, gen token) without running."""
         # Generate Room
         token = self.auth_manager.generate_token()
         self.room = Room(
-            room_id="room1", # Single room for now
+            room_id="room1", 
             token=token,
             files=[self.file_entry]
         )
@@ -123,23 +205,38 @@ class ShareServer:
             sock.bind(('0.0.0.0', 0))
             self.port = sock.getsockname()[1]
             sock.close()
+            
+        return {
+            "ip": local_ip,
+            "port": self.port,
+            "token": token
+        }
 
+    def run_server(self):
+        """Run the server (blocking). Must call prepare() first."""
+        if not self.room:
+             self.prepare()
+        
+        # Run Uvicorn
+        config = uvicorn.Config(self.app, host=self.host, port=self.port, log_level="error")
+        server = uvicorn.Server(config)
+        server.run()
+
+    def start(self):
+        """Legacy start (auto prepare and run)."""
+        info = self.prepare()
         print("\n" + "="*40)
         print(" 🚀 SHARE STARTED")
         print("="*40)
         print(f" 📂 File:  {self.file_entry.name}")
         print(f" 📏 Size:  {self._format_size(self.file_entry.size_bytes)}")
         print("-" * 40)
-        print(f" 📡 IP:    {local_ip}")
-        print(f" 🔌 Port:  {self.port}")
-        print(f" 🔑 Token: {token}")
+        print(f" 📡 IP:    {info['ip']}")
+        print(f" 🔌 Port:  {info['port']}")
+        print(f" 🔑 Token: {info['token']}")
         print("="*40)
         print("\nWaiting for receiver... (Ctrl+C to stop)")
-
-        # Run Uvicorn
-        config = uvicorn.Config(self.app, host=self.host, port=self.port, log_level="error")
-        server = uvicorn.Server(config)
-        server.run()
+        self.run_server()
 
     def _get_local_ip(self):
         try:
