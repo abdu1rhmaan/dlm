@@ -10,11 +10,12 @@ def handle_share_command(args, bus):
     Dispatcher for 'share' subcommand.
     args: parsed arguments from main parser (need to exist).
     """
-    
-    # We need to re-parse or rely on main.py to pass specific args?
-    # main.py will likely pass the whole 'args' object.
-    # We expect 'share_action' (send/receive) and related.
-    
+    if getattr(args, 'share_action', None) == 'send':
+        _do_send(bus)
+    elif getattr(args, 'share_action', None) == 'receive':
+        _do_receive(args, bus)
+    else:
+        print("Usage: share -send | share -rec")
 def _do_send(bus):
     # 1. Pick File
     file_path = pick_file()
