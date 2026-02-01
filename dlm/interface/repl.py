@@ -723,8 +723,9 @@ class DLMShell(cmd.Cmd):
             except:
                 pass
 
-        from types import SimpleNamespace
-        MockArgs = SimpleNamespace(share_action=action, save_to=save_to)
+        class MockArgs:
+            share_action = action
+            save_to = save_to
 
         from dlm.share.cli import handle_share_command
         try:

@@ -100,21 +100,6 @@ def _do_receive(args, bus):
     client = ShareClient(bus)
     save_to = getattr(args, 'save_to', None)
     
-    # Connect and Start
-    # Note: connect() might block on Request? No, 'connect' does Auth+List, then AddDownload+Start.
-    # It returns download_id currently (after my fix).
-    # BUT, 'connect' has user input "Download this file? [Y/n]".
-    # We should probably respect that OR auto-yes if "Immediate Transfer" logic implies it?
-    # Requirement: "dlm share receive MUST start download immediately... DO NOT require user to run go".
-    # Connect confirms with user? 
-    # "Phase 1 improvements... dlm share receive starts download immediately".
-    # I should probably remove the "Download this file?" prompt in client.py OR rely on TUI.
-    # client.py current logic: asks input.
-    # I need to modify client.py to skip input?
-    # Or just let it prompt (it's foreground).
-    # Wait, "Enter a locked display mode... no prompt input".
-    # So I MUST remove the prompt from client.py!
-    
     dl_id = client.connect(ip, port, token, save_to=save_to)
     
     if dl_id:

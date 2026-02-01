@@ -95,7 +95,6 @@ class ShareClient:
             
             # Determine Output Path
             output_template = self._get_output_template(target_file['name'], overrides=save_to)
-            print(f"Queueing download: {final_url}")
             print(f"Destination Folder: {output_template}")
             
             # output_template in DLM/services.py (after my fix) works as the Target Folder

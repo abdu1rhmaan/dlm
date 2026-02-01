@@ -610,6 +610,7 @@ def create_container() -> dict:
             if cmd.state:
                 if cmd.state == "COMPLETED": d.state = DownloadState.COMPLETED
                 elif cmd.state == "FAILED": d.state = DownloadState.FAILED
+                elif cmd.state == "DOWNLOADING": d.state = DownloadState.DOWNLOADING
                 # ... others as needed
             repo.save(d)
 
