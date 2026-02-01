@@ -45,15 +45,27 @@ def _warn_termux_wakelock():
 def handle_share_command(args, bus):
     """
     Dispatcher for 'share' subcommand.
-    args: parsed arguments from main parser.
+    Phase 2: Uses interactive TUI by default, legacy commands for compatibility.
     """
-    if getattr(args, 'share_action', None) == 'send':
+    action = getattr(args, 'share_action', None)
+    
+    if action == 'send':
+        # Legacy: Direct send (Phase 1 compatibility)
         file_path = getattr(args, 'file_path', None)
         _do_send(bus, file_path=file_path)
-    elif getattr(args, 'share_action', None) == 'receive':
+    elif action == 'receive':
+        # Legacy: Direct receive (Phase 1 compatibility)
         _do_receive(args, bus)
     else:
-        print("Usage: dlm share send [file-path] | dlm share receive [ip] [port] [token]")
+        # Phase 2: Interactive TUI
+        try:
+            from .tui import run_share_tui
+            run_share_tui(bus)
+        except ImportError as e:
+            print(f"Error: TUI not available: {e}")
+            print("Falling back to legacy mode...")
+            print("Usage: dlm share send [file-path] | dlm share receive [ip] [port] [token]")
+
 def _do_send(bus, file_path=None):
     import time
     

@@ -4,18 +4,29 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import socket
 import threading
-from typing import Optional
+from typing import Optional, List, Dict
 import os
+from datetime import datetime
 
-from .models import Room, FileEntry
+from .models import FileEntry
 from .auth import AuthManager
+from .room import Room, Device
 
 class ShareServer:
-    def __init__(self, file_entry: FileEntry, port: int = 0, bus=None, upload_task_id: str = None):
+    def __init__(self, file_entries: Optional[List[FileEntry]] = None, port: int = 0, bus=None, upload_task_id: str = None, room=None):
         self.app = FastAPI(title="dlm-share")
         self.auth_manager = AuthManager()
-        self.file_entry = file_entry
-        self.room: Optional[Room] = None
+        
+        # Handle both single FileEntry (Phase 1 legacy) and List[FileEntry] (Phase 2)
+        if file_entries:
+            if isinstance(file_entries, list):
+                self.file_entries = file_entries
+            else:
+                self.file_entries = [file_entries]
+        else:
+            self.file_entries = []
+            
+        self.room = room  # Phase 2: Room instance
         self.port = port
         self.host = "0.0.0.0"
         self._server_thread = None
@@ -23,6 +34,7 @@ class ShareServer:
         self.bus = bus
         self.upload_task_id = upload_task_id
         
+        self.transfer_queues = {} # Track active transfer queues
         self._bytes_sent = 0
         self._lock = threading.Lock()
         self._last_update = 0
@@ -218,17 +230,153 @@ class ShareServer:
                 media_type='application/octet-stream',
                 background=BackgroundTask(on_complete)
             )
+        
+        # Phase 2: Room Endpoints
+        @self.app.get("/room/info")
+        async def get_room_info(session_id: str = Depends(verify_session)):
+            """Get room information and device list."""
+            if not session_id:
+                raise HTTPException(status_code=401, detail="Unauthorized")
+            
+            if not self.room:
+                raise HTTPException(status_code=404, detail="No room available")
+            
+            return {
+                "room_id": self.room.room_id,
+                "host_ip": self.room.host_ip,
+                "port": self.room.port,
+                "devices": [
+                    {
+                        "device_id": d.device_id,
+                        "name": d.name,
+                        "ip": d.ip,
+                        "state": d.state,
+                        "active": d.is_active()
+                    }
+                    for d in self.room.devices
+                ]
+            }
+        
+        @self.app.post("/room/join")
+        async def join_room(request: Request):
+            """Join the room as a new device."""
+            if not self.room:
+                raise HTTPException(status_code=404, detail="No room available")
+            
+            data = await request.json()
+            device_name = data.get("device_name")
+            device_ip = data.get("device_ip")
+            device_id = data.get("device_id")
+            
+            if not device_name or not device_ip:
+                raise HTTPException(status_code=400, detail="device_name and device_ip required")
+            
+            # Import Device model
+            from .room import Device
+            import uuid
+            
+            # Generate device ID if not provided
+            if not device_id:
+                device_id = str(uuid.uuid4())[:8]
+            
+            device = Device(
+                device_id=device_id,
+                name=device_name,
+                ip=device_ip,
+                state="idle"
+            )
+            
+            self.room.add_device(device)
+            print(f"[INFO] Device joined room: {device_name} ({device_ip})")
+            
+            return {
+                "room_id": self.room.room_id,
+                "device_id": device.device_id,
+                "status": "joined"
+            }
+        
+        @self.app.post("/room/heartbeat")
+        async def heartbeat(request: Request):
+            """Update device heartbeat timestamp and return pending transfers."""
+            if not self.room:
+                raise HTTPException(status_code=404, detail="No room available")
+            
+            data = await request.json()
+            device_id = data.get("device_id")
+            
+            if not device_id:
+                raise HTTPException(status_code=400, detail="device_id required")
+            
+            device = self.room.get_device(device_id)
+            if not device:
+                raise HTTPException(status_code=404, detail="Device not found")
+            
+            device.update_heartbeat()
+            
+            # Return and clear pending transfers
+            pending = list(device.pending_transfers)
+            device.pending_transfers.clear()
+            
+            return {
+                "status": "ok",
+                "pending_transfers": pending
+            }
+        
+        @self.app.post("/room/state")
+        async def update_device_state(request: Request):
+            """Update device state (idle/sending/receiving)."""
+            if not self.room:
+                raise HTTPException(status_code=404, detail="No room available")
+            
+            data = await request.json()
+            device_id = data.get("device_id")
+            state = data.get("state")
+            
+            if not device_id or not state:
+                raise HTTPException(status_code=400, detail="device_id and state required")
+            
+            self.room.update_device_state(device_id, state)
+            return {"status": "ok"}
+
+        @self.app.post("/transfer/queue")
+        async def queue_transfer(request: Request, session_id: str = Depends(verify_session)):
+            """Coordinate multi-file transfer queue."""
+            if not session_id:
+                raise HTTPException(status_code=401, detail="Unauthorized")
+            
+            data = await request.json()
+            # data: { "target_devices": [...], "files": [{"file_id": "...", "name": "...", "...", "size": 123}, ...] }
+            
+            target_device_ids = data.get("target_devices", [])
+            files = data.get("files", [])
+            sender_info = data.get("sender", {
+                "ip": self.room.host_ip,
+                "port": self.room.port
+            })
+            
+            if not target_device_ids or not files:
+                raise HTTPException(status_code=400, detail="target_devices and files required")
+            
+            for device_id in target_device_ids:
+                device = self.room.get_device(device_id)
+                if device:
+                    # Add all files to this device's pending list
+                    for f in files:
+                        device.pending_transfers.append({
+                            "action": "download",
+                            "file_id": f["file_id"],
+                            "name": f["name"],
+                            "size": f["size"],
+                            "sender_ip": sender_info.get("ip", self.room.host_ip),
+                            "sender_port": sender_info.get("port", self.room.port)
+                        })
+            
+            import uuid
+            queue_id = str(uuid.uuid4())[:8]
+            return {"queue_id": queue_id, "status": "queued"}
 
     def prepare(self):
         """Prepare server (bind port, gen token) without running."""
-        # Generate Room
-        token = self.auth_manager.generate_token()
-        self.room = Room(
-            room_id="room1", 
-            token=token,
-            files=[self.file_entry]
-        )
-
         # Get local IP
         local_ip = self._get_local_ip()
         
@@ -239,10 +387,26 @@ class ShareServer:
             self.port = sock.getsockname()[1]
             sock.close()
             
+        # If no room provided, create a default one
+        if not self.room:
+            token = self.auth_manager.generate_token()
+            self.room = Room(
+                room_id=self.auth_manager._generate_room_id() if hasattr(self.auth_manager, '_generate_room_id') else "ROOM", 
+                token=token,
+                host_ip=local_ip,
+                port=self.port,
+                devices=[],
+                created_at=datetime.now()
+            )
+        else:
+            # Sync room host/port if needed
+            self.room.host_ip = local_ip
+            self.room.port = self.port
+            
         return {
             "ip": local_ip,
             "port": self.port,
-            "token": token
+            "token": self.room.token
         }
 
     def run_server(self):

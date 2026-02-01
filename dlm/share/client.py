@@ -2,12 +2,22 @@ import requests
 import sys
 import time
 from dlm.app.commands import AddDownload
+from pathlib import Path
+import threading
+from typing import Optional, List
+
 
 class ShareClient:
+    """Client for connecting to share servers and joining rooms."""
+    
     def __init__(self, bus):
         self.bus = bus
-        self.session_id = None
         self.base_url = None
+        self.session_id = None
+        self.device_id = None
+        self.room_id = None
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        self._stop_heartbeat = threading.Event()
 
     def _get_output_template(self, filename: str, overrides: str = None) -> str:
         """
@@ -121,12 +131,220 @@ class ShareClient:
                 except:
                     pass  # ProcessQueue might not exist in older versions
                 
-                return dl_id
+                print(f"✅ Download started! Check progress with 'ls' command.")
             else:
-                print("❌ Failed to queue download.")
-                return None
-
-        except requests.exceptions.ConnectionError:
-            print("❌ Could not connect to sender. Check IP/Port and Firewall.")
+                print("❌ Failed to add download to queue.")
+        
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Connection error: {e}")
         except Exception as e:
-            print(f"❌ Error: {e}")
+            print(f"❌ Unexpected error: {e}")
+    
+    # Phase 2: Room methods
+    def join_room(self, ip: str, port: int, token: str, device_name: str) -> bool:
+        """
+        Join a room and register as a device.
+        
+        Args:
+            ip: Room host IP
+            port: Room port
+            token: Room token
+            device_name: This device's name
+        
+        Returns:
+            True if joined successfully, False otherwise
+        """
+        self.base_url = f"http://{ip}:{port}"
+        
+        try:
+            # 1. Authenticate
+            response = requests.post(
+                f"{self.base_url}/auth",
+                json={"token": token},
+                timeout=5
+            )
+            
+            if response.status_code != 200:
+                return False
+            
+            self.session_id = response.json()["session_id"]
+            
+            # 2. Join room
+            response = requests.post(
+                f"{self.base_url}/room/join",
+                json={
+                    "device_name": device_name,
+                    "device_ip": self._get_local_ip()
+                },
+                headers={"Authorization": f"Bearer {self.session_id}"},
+                timeout=5
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                self.room_id = data["room_id"]
+                self.device_id = data["device_id"]
+                
+                # Start heartbeat
+                self._start_heartbeat()
+                
+                return True
+            
+            return False
+        
+        except Exception as e:
+            print(f"Failed to join room: {e}")
+            return False
+    
+    def get_room_info(self) -> dict:
+        """Get current room information."""
+        if not self.session_id:
+            return None
+        
+        try:
+            response = requests.get(
+                f"{self.base_url}/room/info",
+                headers={"Authorization": f"Bearer {self.session_id}"},
+                timeout=5
+            )
+            
+            if response.status_code == 200:
+                return response.json()
+            
+            return None
+        except Exception:
+            return None
+    
+    def update_device_state(self, state: str):
+        """Update this device's state (idle/sending/receiving)."""
+        if not self.device_id:
+            return
+        
+        try:
+            requests.post(
+                f"{self.base_url}/room/state",
+                json={
+                    "device_id": self.device_id,
+                    "state": state
+                },
+                headers={"Authorization": f"Bearer {self.session_id}"},
+                timeout=5
+            )
+        except Exception:
+            pass
+    
+    def queue_transfer(self, targets: List[str], files: List[dict]) -> bool:
+        """Tell room host to queue transfers for targets."""
+        if not self.session_id:
+            return False
+            
+        try:
+            response = requests.post(
+                f"{self.base_url}/transfer/queue",
+                json={
+                    "target_devices": targets,
+                    "files": files
+                },
+                headers={"Authorization": f"Bearer {self.session_id}"},
+                timeout=5
+            )
+            return response.status_code == 200
+        except Exception:
+            return False
+
+    def control_transfer(self, action: str, device_id: str) -> bool:
+        """Send transfer control command (cancel/skip)."""
+        if not self.session_id:
+            return False
+            
+        try:
+            response = requests.post(
+                f"{self.base_url}/transfer/control",
+                json={
+                    "action": action,
+                    "device_id": device_id
+                },
+                headers={"Authorization": f"Bearer {self.session_id}"},
+                timeout=5
+            )
+            return response.status_code == 200
+        except Exception:
+            return False
+    
+    def _start_heartbeat(self):
+        """Start heartbeat thread."""
+        self._stop_heartbeat.clear()
+        self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self._heartbeat_thread.start()
+    
+    def _heartbeat_loop(self):
+        """Heartbeat loop to maintain presence and process pending transfers."""
+        while not self._stop_heartbeat.is_set():
+            try:
+                response = requests.post(
+                    f"{self.base_url}/room/heartbeat",
+                    json={"device_id": self.device_id},
+                    headers={"Authorization": f"Bearer {self.session_id}"},
+                    timeout=5
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    pending = data.get("pending_transfers", [])
+                    for transfer in pending:
+                        if transfer.get("action") == "download":
+                            self._handle_incoming_transfer(transfer)
+            except Exception:
+                pass
+            
+            # Wait 15 seconds between heartbeats
+            self._stop_heartbeat.wait(15)
+
+    def _handle_incoming_transfer(self, transfer: dict):
+        """Process an incoming transfer request."""
+        target_file = {
+            "file_id": transfer["file_id"],
+            "name": transfer["name"],
+            "size_bytes": transfer["size"]
+        }
+        
+        # Determine URL
+        sender_url = f"http://{transfer['sender_ip']}:{transfer['sender_port']}"
+        download_url = f"{sender_url}/download/{target_file['file_id']}"
+        final_url = f"{download_url}?token={self.session_id}"
+        
+        # Determine Output Path
+        output_template = self._get_output_template(target_file['name'])
+        
+        from dlm.app.commands import AddDownload, StartDownload
+        
+        dl_id = self.bus.handle(AddDownload(
+            url=final_url,
+            output_template=output_template,
+            title=target_file['name'],
+            source='share',
+            total_size=target_file['size_bytes'],
+            ephemeral=True
+        ))
+        
+        if dl_id:
+            self.bus.handle(StartDownload(id=dl_id))
+            self.update_device_state("receiving")
+    
+    def stop_heartbeat(self):
+        """Stop heartbeat thread."""
+        self._stop_heartbeat.set()
+        if self._heartbeat_thread:
+            self._heartbeat_thread.join(timeout=2)
+    
+    def _get_local_ip(self) -> str:
+        """Get local IP address."""
+        import socket
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "127.0.0.1"

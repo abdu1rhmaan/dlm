@@ -24,6 +24,11 @@ CORE_DEPS = [
     "colorama",
     "fastapi",
     "uvicorn",
+    "prompt_toolkit",
+    "zeroconf",
+    "qrcode",
+    "psutil",
+    "netifaces",
 ]
 
 DESKTOP_DEPS = [
