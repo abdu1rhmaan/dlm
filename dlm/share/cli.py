@@ -8,21 +8,29 @@ from .client import ShareClient
 def handle_share_command(args, bus):
     """
     Dispatcher for 'share' subcommand.
-    args: parsed arguments from main parser (need to exist).
+    args: parsed arguments from main parser.
     """
     if getattr(args, 'share_action', None) == 'send':
-        _do_send(bus)
+        file_path = getattr(args, 'file_path', None)
+        _do_send(bus, file_path=file_path)
     elif getattr(args, 'share_action', None) == 'receive':
         _do_receive(args, bus)
     else:
-        print("Usage: share -send | share -rec")
-def _do_send(bus):
+        print("Usage: dlm share send [file-path] | dlm share receive [ip] [port] [token]")
+def _do_send(bus, file_path=None):
     import time
     
-    # 1. Pick File
-    file_path = pick_file()
+    # 1. Pick File (or use provided path)
     if not file_path:
-        return # User aborted or failed
+        file_path = pick_file()
+        if not file_path:
+            return # User aborted or failed
+    
+    # Validate file exists
+    from pathlib import Path
+    if not Path(file_path).exists():
+        print(f"Error: File not found: {file_path}")
+        return
         
     try:
         entry = FileEntry.from_path(file_path)
@@ -112,21 +120,25 @@ def _do_send(bus):
         sys.stdout.flush()
 
 def _do_receive(args, bus):
-    # 1. Ask for details
+    # 1. Get details from args or prompt
     try:
-        ip = input("Sender IP: ").strip()
+        # Use provided arguments or prompt
+        ip = args.ip if hasattr(args, 'ip') and args.ip else input("Sender IP: ").strip()
         if not ip: return
         
-        port_str = input("Sender Port: ").strip()
-        if not port_str: return
-        port = int(port_str)
+        if hasattr(args, 'port') and args.port:
+            port = args.port
+        else:
+            port_str = input("Sender Port: ").strip()
+            if not port_str: return
+            port = int(port_str)
         
-        token = input("Token (XXX-XXX): ").strip()
+        token = args.token if hasattr(args, 'token') and args.token else input("Token (XXX-XXX): ").strip()
         if not token: return
     except KeyboardInterrupt:
         return
     except ValueError:
-        print("Invalid number.")
+        print("Invalid port number.")
         return
 
     # 2. Start Client & Download

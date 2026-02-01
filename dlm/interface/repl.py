@@ -687,34 +687,52 @@ class DLMShell(cmd.Cmd):
         """
         Share files on LAN.
         Usage: 
-          share -send
-          share -rec [-save-to <path>]
+          share send [file-path]
+          share receive [ip] [port] [token] [-save-to <path>]
+          share -send (legacy)
+          share -rec [-save-to <path>] (legacy)
         """
         import shlex
         parts = shlex.split(arg)
         if not parts:
-            print("Usage: share -send | share -rec [-save-to <path>]")
+            print("Usage: share send [file-path] | share receive [ip] [port] [token]")
             return
             
-        # Parse flags
+        # Parse action and arguments
         action = None
+        file_path = None
+        ip = None
+        port = None
+        token = None
         save_to = None
         
-        # Handle -send / -rec / -receive
-        if '-send' in parts:
+        # Determine action (send/receive)
+        if parts[0] in ['send', '-send']:
             action = 'send'
-        elif '-rec' in parts or '-receive' in parts:
+            # Check for file path argument
+            if len(parts) > 1 and not parts[1].startswith('-'):
+                file_path = parts[1]
+        elif parts[0] in ['receive', 'rec', '-rec', '-receive']:
             action = 'receive'
-        # Fallback for old syntax support (optional, but good for UX)
-        elif 'send' in parts:
-            action = 'send'
-        elif 'receive' in parts:
-            action = 'receive'
+            # Check for ip, port, token arguments
+            remaining = parts[1:]
+            non_flag_args = [p for p in remaining if not p.startswith('-')]
+            if len(non_flag_args) >= 1:
+                ip = non_flag_args[0]
+            if len(non_flag_args) >= 2:
+                try:
+                    port = int(non_flag_args[1])
+                except ValueError:
+                    print("Error: Port must be a number")
+                    return
+            if len(non_flag_args) >= 3:
+                token = non_flag_args[2]
             
         if not action:
-            print("Usage: share -send | share -rec [-save-to <path>]")
+            print("Usage: share send [file-path] | share receive [ip] [port] [token]")
             return
 
+        # Parse -save-to flag
         if '-save-to' in parts:
             try:
                 idx = parts.index('-save-to')
@@ -723,9 +741,14 @@ class DLMShell(cmd.Cmd):
             except:
                 pass
 
+        # Create args object
         class MockArgs:
             def __init__(self):
                 self.share_action = action
+                self.file_path = file_path
+                self.ip = ip
+                self.port = port
+                self.token = token
                 self.save_to = save_to
 
         from dlm.share.cli import handle_share_command

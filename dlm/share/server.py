@@ -273,34 +273,86 @@ class ShareServer:
 
     def _get_local_ip(self):
         """Get the actual LAN IP address, with Termux compatibility."""
+        
+        # Method 1: Try psutil (most reliable for Termux and cross-platform)
         try:
-            # Method 1: Try psutil (most reliable for Termux)
-            try:
-                import psutil
-                for interface, addrs in psutil.net_if_addrs().items():
-                    for addr in addrs:
-                        if addr.family == 2:  # AF_INET (IPv4)
-                            ip = addr.address
-                            # Skip loopback and look for 192.168.x.x or 10.x.x.x
+            import psutil
+            for interface, addrs in psutil.net_if_addrs().items():
+                for addr in addrs:
+                    if addr.family == 2:  # AF_INET (IPv4)
+                        ip = addr.address
+                        # Skip loopback, prioritize 192.168.x.x, then 10.x.x.x, then 172.16-31.x.x
+                        if ip.startswith('192.168.'):
+                            return ip
+                        elif ip.startswith('10.'):
+                            return ip
+                        elif ip.startswith('172.'):
+                            try:
+                                second_octet = int(ip.split('.')[1])
+                                if 16 <= second_octet <= 31:
+                                    return ip
+                            except (ValueError, IndexError):
+                                pass
+        except ImportError:
+            pass
+        except Exception:
+            pass
+        
+        # Method 2: Try netifaces (additional fallback)
+        try:
+            import netifaces
+            for interface in netifaces.interfaces():
+                addrs = netifaces.ifaddresses(interface)
+                if netifaces.AF_INET in addrs:
+                    for addr_info in addrs[netifaces.AF_INET]:
+                        ip = addr_info.get('addr')
+                        if ip and not ip.startswith('127.'):
                             if ip.startswith('192.168.') or ip.startswith('10.'):
                                 return ip
-            except ImportError:
-                pass
-            
-            # Method 2: Socket trick (fallback)
+                            elif ip.startswith('172.'):
+                                try:
+                                    second_octet = int(ip.split('.')[1])
+                                    if 16 <= second_octet <= 31:
+                                        return ip
+                                except (ValueError, IndexError):
+                                    pass
+        except ImportError:
+            pass
+        except Exception:
+            pass
+        
+        # Method 3: Socket trick (last resort before hostname)
+        # This can return incorrect IPs on some configurations
+        try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
             ip = s.getsockname()[0]
             s.close()
             
-            # Validate it's a LAN IP
-            if ip.startswith('192.168.') or ip.startswith('10.') or ip.startswith('172.'):
+            # STRICT validation: Only accept if it's a valid LAN IP
+            if ip.startswith('192.168.') or ip.startswith('10.'):
                 return ip
-            
-            # Method 3: Hostname resolution
-            return socket.gethostbyname(socket.gethostname())
-        except:
-            return "127.0.0.1"
+            elif ip.startswith('172.'):
+                try:
+                    second_octet = int(ip.split('.')[1])
+                    if 16 <= second_octet <= 31:
+                        return ip
+                except (ValueError, IndexError):
+                    pass
+        except Exception:
+            pass
+        
+        # Method 4: Hostname resolution (last resort)
+        try:
+            hostname = socket.gethostname()
+            ip = socket.gethostbyname(hostname)
+            if not ip.startswith('127.'):
+                return ip
+        except Exception:
+            pass
+        
+        # Ultimate fallback
+        return "127.0.0.1"
 
     def _format_size(self, size):
         for unit in ['B', 'KB', 'MB', 'GB']:

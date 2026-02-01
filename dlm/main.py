@@ -57,9 +57,15 @@ def main():
     # Share Command (Phase 1)
     share_parser = subparsers.add_parser("share", help="Share files on LAN")
     share_subparsers = share_parser.add_subparsers(dest="share_action", help="Action")
-    share_subparsers.add_parser("send", help="Send a file")
+    
+    send_parser = share_subparsers.add_parser("send", help="Send a file")
+    send_parser.add_argument("file_path", nargs='?', help="Path to file to send")
+    
     receive_parser = share_subparsers.add_parser("receive", help="Receive a file")
-    receive_parser.add_argument("-save-to", help="Destination folder override", default=None)
+    receive_parser.add_argument("ip", nargs='?', help="Sender IP address")
+    receive_parser.add_argument("port", nargs='?', type=int, help="Sender port")
+    receive_parser.add_argument("token", nargs='?', help="Authentication token")
+    receive_parser.add_argument("-save-to", "--save-to", help="Destination folder override", default=None)
 
     args = parser.parse_args()
 
