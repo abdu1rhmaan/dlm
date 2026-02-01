@@ -1557,9 +1557,10 @@ class DownloadService:
                 self._cleanup_on_completion(dl)
 
     def _share_download_worker(self, dl: Download, cancel_event: threading.Event):
-        """Dedicated worker for share downloads with real-time progress."""
+        """Dedicated worker for share downloads with optimized streaming and stable speed reporting."""
         import requests
         import time
+        from collections import deque
         
         folder = self._get_download_folder(dl)
         folder.mkdir(parents=True, exist_ok=True)
@@ -1579,13 +1580,21 @@ class DownloadService:
                     self.repository.save(dl)
                     return
             
-            # Download with chunked progress
+            # Download configuration
             downloaded_bytes = 0
-            chunk_size = 64 * 1024  # 64KB chunks
+            chunk_size = 512 * 1024  # 512KB chunks (up from 64KB for stability)
+            buffer_size = 2 * 1024 * 1024  # 2MB write buffer
+            
+            # Speed smoothing with moving average
+            speed_window = deque(maxlen=20)  # Last 20 samples (~2 seconds at 100ms intervals)
             last_update_time = time.time()
             last_update_bytes = 0
             
-            with open(target_file, 'wb') as f:
+            # Buffered writing
+            chunk_buffer = []
+            buffer_bytes = 0
+            
+            with open(target_file, 'wb', buffering=buffer_size) as f:
                 for chunk in response.iter_content(chunk_size=chunk_size):
                     if cancel_event.is_set():
                         dl.state = DownloadState.PAUSED
@@ -1593,27 +1602,47 @@ class DownloadService:
                         return
                     
                     if chunk:
-                        f.write(chunk)
+                        # Add to buffer
+                        chunk_buffer.append(chunk)
+                        buffer_bytes += len(chunk)
                         downloaded_bytes += len(chunk)
                         
-                        # Calculate instantaneous speed
+                        # Write buffer when threshold reached
+                        if buffer_bytes >= buffer_size:
+                            for buffered_chunk in chunk_buffer:
+                                f.write(buffered_chunk)
+                            chunk_buffer = []
+                            buffer_bytes = 0
+                        
+                        # Calculate smoothed speed
                         current_time = time.time()
                         time_diff = current_time - last_update_time
+                        
                         if time_diff >= 0.1:  # Update every 100ms
                             bytes_diff = downloaded_bytes - last_update_bytes
-                            speed = bytes_diff / time_diff if time_diff > 0 else 0
+                            instant_speed = bytes_diff / time_diff if time_diff > 0 else 0
                             
-                            # Emit progress update
+                            # Add to moving average window
+                            speed_window.append(instant_speed)
+                            
+                            # Calculate smoothed speed (average of window)
+                            smoothed_speed = sum(speed_window) / len(speed_window) if speed_window else 0
+                            
+                            # Emit progress update with smoothed speed
                             from dlm.app.commands import UpdateExternalTask
                             if hasattr(self, 'bus') and self.bus:
                                 self.bus.handle(UpdateExternalTask(
                                     id=dl.id,
                                     downloaded_bytes=downloaded_bytes,
-                                    speed=speed
+                                    speed=smoothed_speed
                                 ))
                             
                             last_update_time = current_time
                             last_update_bytes = downloaded_bytes
+                
+                # Flush remaining buffer
+                for buffered_chunk in chunk_buffer:
+                    f.write(buffered_chunk)
             
             # Final update and completion
             dl.state = DownloadState.COMPLETED

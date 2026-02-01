@@ -5,6 +5,43 @@ from .picker import pick_file
 from .server import ShareServer
 from .client import ShareClient
 
+def _check_termux_wakelock():
+    """Check if running in Termux and if wakelock might be needed."""
+    import os
+    import subprocess
+    
+    # Detect Termux
+    is_termux = (
+        "TERMUX_VERSION" in os.environ or 
+        "/data/data/com.termux" in os.environ.get("PATH", "")
+    )
+    
+    if not is_termux:
+        return True  # Not Termux, no warning needed
+    
+    # Check if termux-wake-lock command exists
+    try:
+        result = subprocess.run(
+            ["which", "termux-wake-lock"],
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
+        # If command exists, assume user knows about it
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+        # Command not found or error
+        return False
+
+def _warn_termux_wakelock():
+    """Display warning about wakelock if needed."""
+    if not _check_termux_wakelock():
+        print("\n⚠️  \033[1;33mWARNING: Running on Termux\033[0m")
+        print("   Android may throttle network during transfer.")
+        print("   \033[1;32mRecommended:\033[0m Run 'termux-wake-lock' before sharing")
+        print("   (Install with: pkg install termux-api)\n")
+
+
 def handle_share_command(args, bus):
     """
     Dispatcher for 'share' subcommand.
@@ -19,6 +56,9 @@ def handle_share_command(args, bus):
         print("Usage: dlm share send [file-path] | dlm share receive [ip] [port] [token]")
 def _do_send(bus, file_path=None):
     import time
+    
+    # Check Termux wakelock before starting
+    _warn_termux_wakelock()
     
     # 1. Pick File (or use provided path)
     if not file_path:
@@ -120,6 +160,9 @@ def _do_send(bus, file_path=None):
         sys.stdout.flush()
 
 def _do_receive(args, bus):
+    # Check Termux wakelock before starting
+    _warn_termux_wakelock()
+    
     # 1. Get details from args or prompt
     try:
         # Use provided arguments or prompt
