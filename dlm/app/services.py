@@ -870,7 +870,7 @@ class DownloadService:
             # If we are already at capacity, let it stay in WAITING/QUEUED/DEQUE
             if self._get_active_count() >= self.concurrency_limit:
                 if dl.state != DownloadState.WAITING:
-                    dl.state = DownloadState.WAITING
+        dl.state = DownloadState.WAITING
                     self.repository.save(dl)
                 return
 
@@ -913,6 +913,12 @@ class DownloadService:
             
             self.executor.submit(do_discovery)
             return
+
+        # [ARCH-FIX] Ensure segments are initialized for known-size downloads (e.g. Share)
+        # This prevents them from falling back to _stream_worker which might have progress tracking issues for known sizes.
+        if dl.total_size > 0 and not dl.segments and dl.source not in ['youtube', 'tiktok', 'spotify', 'torrent']:
+             self._initialize_segments(dl)
+             self.repository.save(dl)
 
         # 3. Final Checks ...
         if dl.source == "tiktok":
