@@ -111,6 +111,34 @@ def _try_termux_picker() -> Tuple[bool, str]:
     except Exception:
         return False, ""
 
+def _try_ranger_picker() -> Tuple[bool, str]:
+    """Attempt to use ranger console file manager."""
+    if not shutil.which("ranger"):
+        return False, ""
+        
+    try:
+        # Create temp file for ranger to write validation
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp_path = tmp.name
+            
+        # ranger --choosefile=TARGET
+        # This opens ranger, user picks file, it writes path to TARGET and exits
+        subprocess.run(["ranger", f"--choosefile={tmp_path}"], check=False)
+        
+        chosen_path = ""
+        if os.path.exists(tmp_path):
+            with open(tmp_path, 'r') as f:
+                chosen_path = f.read().strip()
+            os.unlink(tmp_path)
+            
+        if chosen_path:
+            return True, chosen_path
+            
+        return False, ""
+    except Exception:
+        return False, ""
+
 def pick_file() -> Optional[str]:
     """
     Select a file using available GUI or fallback to manual input.
@@ -124,6 +152,13 @@ def pick_file() -> Optional[str]:
         success, path = _try_termux_picker()
         if success:
             picked_via_gui = True
+        else:
+            print("⚠️  Android picker failed/missing. Trying ranger...")
+            success, path = _try_ranger_picker()
+            if success:
+                picked_via_gui = True
+            else:
+                 print("⚠️  ranger not found. Falling back to manual input.")
     else:
         print("🖥️  Launching System file picker...")
         success, path = _try_tkinter_picker()
