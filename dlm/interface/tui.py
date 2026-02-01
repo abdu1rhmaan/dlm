@@ -195,7 +195,13 @@ class TUI:
         title_block = short_title.ljust(effective_max)
         
         # Bar: Pink/Cyan Filling, ╸ Black Accent, Match-181818 Track
-        bar_width = 15
+        # Calculate bar width dynamically based on available space
+        # Format: [#X] Filename | ━━━━━━━━━━━━━━━ | Status | Size
+        # Reserve space for: prefix (8) + title (effective_max) + separators (6) + stats (len(stats_part))
+        reserved = 8 + effective_max + 6 + len(stats_part)
+        available_for_bar = max(10, term_width - reserved)  # Minimum 10 chars for bar
+        bar_width = min(available_for_bar, 30)  # Cap at 30 for aesthetics
+        
         try: pct = float(progress_str.replace('%',''))
         except: pct = 0.0
         filled = int(pct/100 * bar_width) if (total > 0 or state == 'COMPLETED' or pct > 0) else 0

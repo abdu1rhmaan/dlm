@@ -608,7 +608,19 @@ def create_container() -> dict:
             d._downloaded_bytes_override = cmd.downloaded_bytes
             d.speed_bps = cmd.speed
             if cmd.state:
-                if cmd.state == "COMPLETED": d.state = DownloadState.COMPLETED
+                if cmd.state == "COMPLETED": 
+                    d.state = DownloadState.COMPLETED
+                    repo.save(d)
+                    # Auto-delete external tasks after completion (they're ephemeral)
+                    # Give a brief moment for TUI to show completion, then remove
+                    import threading
+                    def cleanup():
+                        import time
+                        time.sleep(1)  # Wait 1 second for TUI to render completion
+                        repo.delete(cmd.id)
+                        _rebuild_index_mapping(repo)
+                    threading.Thread(target=cleanup, daemon=True).start()
+                    return
                 elif cmd.state == "FAILED": d.state = DownloadState.FAILED
                 elif cmd.state == "DOWNLOADING": d.state = DownloadState.DOWNLOADING
                 # ... others as needed

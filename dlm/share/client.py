@@ -100,7 +100,7 @@ class ShareClient:
             # output_template in DLM/services.py (after my fix) works as the Target Folder
             from dlm.app.commands import StartDownload
             
-            dl_id = self.bus.handle(AddDownload(url=final_url, output_template=output_template, title=target_file['name']))
+            dl_id = self.bus.handle(AddDownload(url=final_url, output_template=output_template, title=target_file['name'], source='share'))
             
             if dl_id:
                 # print(f"🚀 Initializing download (ID: {dl_id})...") # Reduced noise

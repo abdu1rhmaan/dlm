@@ -542,6 +542,15 @@ class DownloadService:
 
             # 3. Finalize State & Queue
             self._on_task_terminated(dl)
+            
+            # 4. Auto-delete share downloads (ephemeral)
+            if dl.source == 'share' or (dl.source == 'upload' and dl.url == 'external://transfer'):
+                import threading
+                def cleanup_share():
+                    import time
+                    time.sleep(1)  # Wait for TUI to show completion
+                    self.repository.delete(dl.id)
+                threading.Thread(target=cleanup_share, daemon=True).start()
                             
         except Exception as e:
              print(f"[CLEANUP] Error: {e}")
