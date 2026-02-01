@@ -55,7 +55,7 @@ class ShareServer:
 
         # 3. List Files
         @self.app.get("/list")
-        async def list_files(session_id: str = Depends(verify_session)):
+        async def list_files(request: Request, session_id: str = Depends(verify_session)):
             if not session_id:
                  print(f"[INFO] Unauthorized connection attempt from {request.client.host}")
                  raise HTTPException(status_code=401, detail="Unauthorized")
