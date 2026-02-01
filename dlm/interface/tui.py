@@ -19,7 +19,7 @@ class TUI:
         try:
             while True:
                 # 1. Fetch State (Global)
-                all_downloads = self.bus.handle(ListDownloads(recursive=True))
+                all_downloads = self.bus.handle(ListDownloads(recursive=True, include_ephemeral=True))
                 now = time.time()
                 
                 # 2. Logic: Process Active and Transitions
@@ -81,7 +81,7 @@ class TUI:
         
         try:
             while True:
-                all_downloads = self.bus.handle(ListDownloads(recursive=True))
+                all_downloads = self.bus.handle(ListDownloads(recursive=True, include_ephemeral=True))
                 # Filter for our task
                 target = next((d for d in all_downloads if d['id'] == task_id), None)
                 

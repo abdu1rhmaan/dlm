@@ -123,6 +123,9 @@ class Download:
 
     # Folder Link
     folder_id: Optional[int] = None
+    
+    # Live/Ephemeral Flag (No DB persistence)
+    ephemeral: bool = False
 
     @property
     def is_cut(self) -> bool:

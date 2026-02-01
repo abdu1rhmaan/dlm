@@ -209,18 +209,14 @@ class ShareServer:
                         state="COMPLETED"
                     ))
 
-            # Explicitly set Content-Length to ensure receiver can see it
-            headers = {
-                "Content-Length": str(self.file_entry.size_bytes),
-                "Accept-Ranges": "bytes"
-            }
-
+            # Allow explicit headers to be managed by FileResponse (except explicit ones we need)
+            # FileResponse handles Content-Length and Content-Range for us.
+            
             return FileResponse(
                 path, 
                 filename=self.file_entry.name,
                 media_type='application/octet-stream',
-                background=BackgroundTask(on_complete),
-                headers=headers
+                background=BackgroundTask(on_complete)
             )
 
     def prepare(self):

@@ -394,10 +394,22 @@ def create_container() -> dict:
         # Normal list: Folders first, then tasks
         if cmd.recursive:
             folders = []
-            downloads = repo.get_all()
+            downloads = service.get_all_downloads(include_ephemeral=cmd.include_ephemeral)
         else:
             folders = repo.get_folders(cmd.folder_id)
+            # If standard list, get from repo. If ephemeral included (monitor), get all merged?
+            # Ideally monitor calls with recursive=False usually?
+            # Actually TUI monitor calls with `recursive` usually? No.
+            # Let's support ephemeral on folder-view too (they usually have no folder_id)
             downloads = repo.get_all_by_folder(cmd.folder_id)
+            if cmd.include_ephemeral and cmd.folder_id is None:
+                 # Add ephemeral tasks to root view
+                 ephemeral = service.get_all_downloads(include_ephemeral=True)
+                 # Filter only ephemeral ones from the result
+                 # (Since get_all_downloads returns repo+ephemeral)
+                 # A bit inefficient, but safe.
+                 only_ephemeral = [d for d in ephemeral if getattr(d, 'ephemeral', False)]
+                 downloads.extend(only_ephemeral)
         
         results = []
         idx = 1

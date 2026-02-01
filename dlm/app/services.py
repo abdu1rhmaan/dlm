@@ -120,6 +120,7 @@ class DownloadService:
         
         # Track active downloads in memory
         self._active_downloads: Dict[str, Download] = {}
+        self._ephemeral_memory: Dict[str, Download] = {} # Live tasks (Share), NO DB persistence
         self._cancel_events: Dict[str, threading.Event] = {}
         self._last_tiktok_profile_download: Dict[str, float] = {} # For rate-limit guard
         self._batch_queue: deque = deque() # Real ordered queue for batch tasks
@@ -329,8 +330,9 @@ class DownloadService:
             
             # 2. الحفظ النهائي
             try:
-                self.repository.save(dl)
-                self._save_metadata(dl)
+                if not getattr(dl, 'ephemeral', False):
+                    self.repository.save(dl)
+                    self._save_metadata(dl)
             except:
                 pass
             
@@ -762,13 +764,23 @@ class DownloadService:
                 dl.resumable = self.network.supports_ranges(url, referer=dl.referer)
             self._initialize_segments(dl)
             dl.state = DownloadState.QUEUED
-            self.repository.save(dl)
+            if ephemeral:
+                dl.ephemeral = True
+                self._ephemeral_memory[dl.id] = dl
+            else:
+                self.repository.save(dl)
+                
+            self._start_workers(dl)
             return dl.id
         except Exception:
             dl.total_size = 0
             dl.resumable = False
             dl.state = DownloadState.QUEUED
-            self.repository.save(dl)
+            if ephemeral:
+                dl.ephemeral = True
+                self._ephemeral_memory[dl.id] = dl
+            else:
+                self.repository.save(dl)
             return dl.id
 
     def promote_browser_capture(self, capture_id: int, folder_id: int = None) -> str:
@@ -2470,7 +2482,8 @@ class DownloadService:
                     self.trigger_renewal(dl.id)
                 else:
                     dl.fail(f"Stream error: {e}")
-                    self.repository.save(dl)
+                    if not getattr(dl, 'ephemeral', False):
+                        self.repository.save(dl)
 
     def _monitor_download(self, dl: Download, cancel_event: threading.Event):
         last_bytes = dl.get_downloaded_bytes()
@@ -2523,8 +2536,9 @@ class DownloadService:
             dl.last_update = datetime.now()
             
             # Persist Progress
-            self.repository.save(dl)
-            self._save_metadata(dl)
+            if not getattr(dl, 'ephemeral', False):
+                self.repository.save(dl)
+                self._save_metadata(dl)
             
             # Check Completion
             if dl.segments and all(s.is_complete for s in dl.segments):
@@ -2540,7 +2554,8 @@ class DownloadService:
                      return
 
                 dl.current_stage = "finalizing"
-                self.repository.save(dl)
+                if not getattr(dl, 'ephemeral', False):
+                    self.repository.save(dl)
                 self._finalize_download(dl)
                 return
         
@@ -2551,8 +2566,9 @@ class DownloadService:
 
         # Cancelled - save final state
         dl.last_update = datetime.now()
-        self.repository.save(dl)
-        self._save_metadata(dl)
+        if not getattr(dl, 'ephemeral', False):
+            self.repository.save(dl)
+            self._save_metadata(dl)
 
     def _wait_and_cleanup(self, dl: Download):
         """Wait for workers to finish and clean up files."""

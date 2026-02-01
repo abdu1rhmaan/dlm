@@ -26,6 +26,7 @@ class AddDownload(Command):
     torrent_file_offset: int = 0
     total_size: int = 0
     folder_id: Optional[int] = None
+    ephemeral: bool = False
 
 @dataclass
 class ListDownloads(Command):
@@ -33,6 +34,7 @@ class ListDownloads(Command):
     folder_id: Optional[int] = None
     recursive: bool = False
     include_workspace: bool = False
+    include_ephemeral: bool = False
 
 @dataclass
 class StartDownload(Command):

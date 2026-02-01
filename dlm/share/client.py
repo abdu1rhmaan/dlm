@@ -105,7 +105,8 @@ class ShareClient:
                 output_template=output_template, 
                 title=target_file['name'], 
                 source='share',
-                total_size=target_file['size_bytes']
+                total_size=target_file['size_bytes'],
+                ephemeral=True
             ))
             
             if dl_id:
