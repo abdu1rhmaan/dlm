@@ -103,7 +103,9 @@ def create_container() -> dict:
             torrent_files=cmd.torrent_files,
             torrent_file_offset=cmd.torrent_file_offset,
             total_size=cmd.total_size,
-            folder_id=cmd.folder_id
+            folder_id=cmd.folder_id,
+            output_template=cmd.output_template,
+            rename_template=cmd.rename_template
         )
         _rebuild_index_mapping(repo, folder_id=cmd.folder_id)
         return result
@@ -572,12 +574,12 @@ def create_container() -> dict:
                 raise ValueError("Folder not empty. Use --force to delete recursively.")
         
         # Recursive deletion logic in service would be better, but let's do a simple one here if force
-        #Recursive deletion logic in service would be better, but let's do a simple one here if force
         if cmd.force:
             service.delete_folder_recursively(cmd.folder_id)
         else:
             repo.delete_folder(cmd.folder_id)
 
+    
     def handle_register_external_task(cmd: RegisterExternalTask):
         import uuid
         import datetime
@@ -610,7 +612,6 @@ def create_container() -> dict:
                 elif cmd.state == "FAILED": d.state = DownloadState.FAILED
                 # ... others as needed
             repo.save(d)
-
 
     # 5. Bus
     bus = CommandBus()

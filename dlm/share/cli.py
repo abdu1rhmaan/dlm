@@ -50,18 +50,25 @@ def _do_send(bus):
     tui = TUI(bus)
     
     # Header Info
-    header = [
-        f"\033[1;32m[ SHARE SENDER ]\033[0m",
-        f"File:  {entry.name}",
-        f"Size:  {server._format_size(entry.size_bytes)}",
-        f"IP:    \033[1;33m{info['ip']}\033[0m",
-        f"Port:  \033[1;33m{info['port']}\033[0m",
-        f"Token: \033[1;33m{info['token']}\033[0m",
-        ""
-    ]
+    # Header Info Callback
+    def get_header():
+        # Check active clients
+        clients = list(getattr(server, 'connected_clients', []))
+        status_line = f"Clients: \033[1;32m{len(clients)} Connected\033[0m" if clients else "Clients: \033[1;31mWaiting...\033[0m"
+        
+        return [
+            f"\033[1;32m[ SHARE SENDER ]\033[0m",
+            f"File:  {entry.name}",
+            f"Size:  {server._format_size(entry.size_bytes)}",
+            f"IP:    \033[1;33m{info['ip']}\033[0m",
+            f"Port:  \033[1;33m{info['port']}\033[0m",
+            f"Token: \033[1;33m{info['token']}\033[0m",
+            status_line,
+            ""
+        ]
     
     try:
-        tui.monitor_task(upload_id, custom_header=header)
+        tui.monitor_task(upload_id, custom_header=get_header)
     except KeyboardInterrupt:
         pass
     

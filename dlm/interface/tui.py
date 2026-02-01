@@ -70,8 +70,11 @@ class TUI:
             sys.stdout.flush()
             return True 
 
-    def monitor_task(self, task_id: str, custom_header: list = None):
-        """Monitor a specific task until completion or Ctrl+C."""
+    def monitor_task(self, task_id: str, custom_header=None):
+        """
+        Monitor a specific task until completion or Ctrl+C.
+        custom_header: List[str] OR Callable[[], List[str]]
+        """
         # Initial clear
         sys.stdout.write("\033[2J\033[H")
         sys.stdout.flush()
@@ -82,6 +85,9 @@ class TUI:
                 # Filter for our task
                 target = next((d for d in all_downloads if d['id'] == task_id), None)
                 
+                # Resolve Header
+                header_lines = custom_header() if callable(custom_header) else custom_header
+
                 if not target:
                     print("Task not found or removed.")
                     break
@@ -89,7 +95,7 @@ class TUI:
                 # Check completion
                 if target['state'] in ['COMPLETED', 'FAILED', 'CANCELLED']:
                     # Final Render
-                    self._render_active_tasks([target], len(target.get('filename','')), custom_header=custom_header)
+                    self._render_active_tasks([target], len(target.get('filename','')), custom_header=header_lines)
                     
                     msg = f"Task {target['state']}."
                     if target['state'] == 'FAILED':
@@ -99,11 +105,19 @@ class TUI:
                     else:
                          print(f"\n{msg} Press Ctrl+C to exit.")
                     
-                    time.sleep(1)
-                    continue
+                    # Keep monitoring for a moment or exit?
+                    # User likely wants to see the "Completed" state.
+                    # But we break to return to shell.
+                    # Wait a bit for user to see.
+                    # Actually, let's wait for Ctrl+C if completed, or just exit?
+                    # User feedback: "As soon as it completes... green". 
+                    # If I return immediately, prompt overwrites it. 
+                    # Let's wait for input? No, monitor_task should block.
+                    # Let's just return.
+                    break
 
                 # Render
-                self._render_active_tasks([target], len(target.get('filename','')), custom_header=custom_header)
+                self._render_active_tasks([target], len(target.get('filename','')), custom_header=header_lines)
                 time.sleep(0.25)
         except KeyboardInterrupt:
             # Clear screen

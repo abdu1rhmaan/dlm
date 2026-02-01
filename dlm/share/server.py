@@ -27,6 +27,9 @@ class ShareServer:
         self._lock = threading.Lock()
         self._last_update = 0
         
+        # Track connected clients for UI
+        self.connected_clients = set()
+        
         # Add Middleware for Progress
         if self.bus and self.upload_task_id:
             self.app.middleware("http")(self.progress_middleware)
@@ -145,6 +148,20 @@ class ShareServer:
         # 4. Download File
         @self.app.get("/download/{file_id}")
         async def download_file(file_id: str, request: Request, session_id: Optional[str] = Depends(verify_session), token: Optional[str] = None):
+            # Track Client
+            client_ip = request.client.host
+            with self._lock:
+                self.connected_clients.add(client_ip)
+
+            # Allow auth via Query param 'token' if header is missing (for dlm engine integration)
+            if not session_id:
+                if token and self.auth_manager.validate_session(token):
+            # Explicitly set Content-Length to ensure receiver can see it
+            headers = {
+                "Content-Length": str(self.file_entry.size_bytes),
+                "Accept-Ranges": "bytes"
+            }
+            
             # Allow auth via Query param 'token' if header is missing (for dlm engine integration)
             if not session_id:
                 if token and self.auth_manager.validate_session(token):
@@ -159,9 +176,17 @@ class ShareServer:
             if not os.path.exists(path):
                 raise HTTPException(status_code=404, detail="File content missing")
 
-            # Support Range requests (critically important for dlm downloader)
-            # Support Range requests (critically important for dlm downloader)
+            # Support Range requests logic handled by FileResponse/Starlette
             print(f"[INFO] Transfer started: {self.file_entry.name} -> {request.client.host}")
+            
+            # Notify DLM that transfer started (Switch color to Pink/Active)
+            if self.bus and self.upload_task_id:
+                 from dlm.app.commands import UpdateExternalTask
+                 self.bus.handle(UpdateExternalTask(
+                     id=self.upload_task_id,
+                     downloaded_bytes=0, # Start
+                     state="DOWNLOADING"
+                 ))
             
             # Hook into response to log completion?
             # FileResponse streams. We can subclass or use background task.
@@ -179,11 +204,18 @@ class ShareServer:
                         state="COMPLETED"
                     ))
 
+            # Explicitly set Content-Length to ensure receiver can see it
+            headers = {
+                "Content-Length": str(self.file_entry.size_bytes),
+                "Accept-Ranges": "bytes"
+            }
+
             return FileResponse(
                 path, 
                 filename=self.file_entry.name,
                 media_type='application/octet-stream',
-                background=BackgroundTask(on_complete)
+                background=BackgroundTask(on_complete),
+                headers=headers
             )
 
     def prepare(self):
