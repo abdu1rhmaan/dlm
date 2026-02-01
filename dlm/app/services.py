@@ -727,6 +727,7 @@ class DownloadService:
             return dl.id
 
             # Step 2: Standard HTTP
+        try:
             if total_size > 0:
                  dl.total_size = total_size
                  dl.resumable = True # Assume resumable if we have explicit size (implied safe source)
