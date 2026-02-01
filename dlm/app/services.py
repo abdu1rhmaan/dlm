@@ -1318,6 +1318,22 @@ class DownloadService:
             threading.Thread(target=self._monitor_download, args=(dl, cancel_event), daemon=True).start()
             return
 
+        # 1.5. Branch for Share Downloads (Real-time Progress)
+        if dl.source == 'share':
+            with self._lock:
+                dl.state = DownloadState.DOWNLOADING
+                dl.error_message = None
+                self.repository.save(dl)
+                self._active_downloads[dl.id] = dl
+                cancel_event = threading.Event()
+                self._cancel_events[dl.id] = cancel_event
+                dl._futures = []
+            
+            f = self.executor.submit(self._share_download_worker, dl, cancel_event)
+            dl._futures.append(f)
+            threading.Thread(target=self._monitor_download, args=(dl, cancel_event), daemon=True).start()
+            return
+
         # 2. Standard HTTP Pipeline
         self._validate_and_rollback(dl)
         
@@ -1539,6 +1555,79 @@ class DownloadService:
                 dl.fail(str(e))
                 self.repository.save(dl)
                 self._cleanup_on_completion(dl)
+
+    def _share_download_worker(self, dl: Download, cancel_event: threading.Event):
+        """Dedicated worker for share downloads with real-time progress."""
+        import requests
+        import time
+        
+        folder = self._get_download_folder(dl)
+        folder.mkdir(parents=True, exist_ok=True)
+        target_file = folder / dl.target_filename
+        
+        try:
+            # Use requests.get with stream=True for chunked reading
+            response = requests.get(dl.url, stream=True, timeout=30)
+            response.raise_for_status()
+            
+            # Verify total size matches
+            content_length = response.headers.get('Content-Length')
+            if content_length:
+                server_size = int(content_length)
+                if server_size != dl.total_size:
+                    dl.fail(f"Size mismatch: expected {dl.total_size}, got {server_size}")
+                    self.repository.save(dl)
+                    return
+            
+            # Download with chunked progress
+            downloaded_bytes = 0
+            chunk_size = 64 * 1024  # 64KB chunks
+            last_update_time = time.time()
+            last_update_bytes = 0
+            
+            with open(target_file, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    if cancel_event.is_set():
+                        dl.state = DownloadState.PAUSED
+                        self.repository.save(dl)
+                        return
+                    
+                    if chunk:
+                        f.write(chunk)
+                        downloaded_bytes += len(chunk)
+                        
+                        # Calculate instantaneous speed
+                        current_time = time.time()
+                        time_diff = current_time - last_update_time
+                        if time_diff >= 0.1:  # Update every 100ms
+                            bytes_diff = downloaded_bytes - last_update_bytes
+                            speed = bytes_diff / time_diff if time_diff > 0 else 0
+                            
+                            # Emit progress update
+                            from dlm.app.commands import UpdateExternalTask
+                            if hasattr(self, 'bus') and self.bus:
+                                self.bus.handle(UpdateExternalTask(
+                                    id=dl.id,
+                                    downloaded_bytes=downloaded_bytes,
+                                    speed=speed
+                                ))
+                            
+                            last_update_time = current_time
+                            last_update_bytes = downloaded_bytes
+            
+            # Final update and completion
+            dl.state = DownloadState.COMPLETED
+            self.repository.save(dl)
+            self._cleanup_on_completion(dl)
+            
+        except requests.exceptions.RequestException as e:
+            dl.fail(f"Download failed: {e}")
+            self.repository.save(dl)
+        except Exception as e:
+            dl.fail(f"Unexpected error: {e}")
+            self.repository.save(dl)
+        finally:
+            self._on_task_terminated(dl)
 
     def _vocals_loop(self):
         """Background worker for monitoring and processing vocals queue."""

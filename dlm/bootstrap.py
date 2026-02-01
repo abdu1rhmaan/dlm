@@ -81,6 +81,9 @@ def create_container() -> dict:
     media_service = MediaService(config_repo=config_repo)
     service = DownloadService(repo, http_network, dl_dir, media_service=media_service, config_repo=config_repo)
     service.torrent_network = torrent_network # Inject torrent network
+    
+    # NOTE: Bus will be injected after creation (circular dependency)
+    # See below where we do: service.bus = bus
 
     # Initial index rebuild
     _rebuild_index_mapping(repo)
@@ -615,7 +618,13 @@ def create_container() -> dict:
         return d.id
 
     def handle_update_external_task(cmd: UpdateExternalTask):
+        # Check repository first
         d = repo.get(cmd.id)
+        
+        # If not in repo, check ephemeral memory (for share downloads)
+        if not d and hasattr(service, '_ephemeral_memory'):
+            d = service._ephemeral_memory.get(cmd.id)
+        
         if d:
             # Update basic stats
             d._downloaded_bytes_override = cmd.downloaded_bytes
@@ -623,21 +632,26 @@ def create_container() -> dict:
             if cmd.state:
                 if cmd.state == "COMPLETED": 
                     d.state = DownloadState.COMPLETED
-                    repo.save(d)
-                    # Auto-delete external tasks after completion (they're ephemeral)
-                    # Give a brief moment for TUI to show completion, then remove
-                    import threading
-                    def cleanup():
-                        import time
-                        time.sleep(1)  # Wait 1 second for TUI to render completion
-                        repo.delete(cmd.id)
-                        _rebuild_index_mapping(repo)
-                    threading.Thread(target=cleanup, daemon=True).start()
+                    # Only save to repo if not ephemeral
+                    if not getattr(d, 'ephemeral', False):
+                        repo.save(d)
+                        # Auto-delete external tasks after completion (they're ephemeral)
+                        # Give a brief moment for TUI to show completion, then remove
+                        import threading
+                        def cleanup():
+                            import time
+                            time.sleep(1)  # Wait 1 second for TUI to render completion
+                            repo.delete(cmd.id)
+                            _rebuild_index_mapping(repo)
+                        threading.Thread(target=cleanup, daemon=True).start()
                     return
                 elif cmd.state == "FAILED": d.state = DownloadState.FAILED
                 elif cmd.state == "DOWNLOADING": d.state = DownloadState.DOWNLOADING
                 # ... others as needed
-            repo.save(d)
+            
+            # Save to repo only if not ephemeral
+            if not getattr(d, 'ephemeral', False):
+                repo.save(d)
 
     # 5. Bus
     bus = CommandBus()
@@ -660,6 +674,9 @@ def create_container() -> dict:
     bus.register(CreateFolder, handle_create_folder)
     bus.register(MoveTask, handle_move_task)
     bus.register(DeleteFolder, handle_delete_folder)
+    
+    # Inject bus into service for share download progress updates
+    service.bus = bus
 
     return {
         "bus": bus,
