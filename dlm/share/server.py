@@ -1234,7 +1234,7 @@ dlm share join --ip {host} --port {port} --token {token}
         fileList.innerHTML = '';
         if (!state.files || state.files.length === 0) {{
              fileList.innerHTML = '<tr><td colspan="3" style="text-align:center" class="dim">Shared directory is empty</td></tr>';
-        } else {{
+        }} else {{
             state.files.forEach(f => {{
                 const row = document.createElement('tr');
                 row.innerHTML = `
