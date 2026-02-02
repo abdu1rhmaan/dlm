@@ -104,7 +104,9 @@ class ShareTUI:
         def _refresh_bg():
             if self.client:
                 try:
-                    self.client.get_room_info()
+                    data = self.client.get_room_info()
+                    if data:
+                        self._sync_room_state(data)
                 except:
                     pass
             # Clear message after refresh
@@ -147,7 +149,9 @@ class ShareTUI:
             try:
                 if self.screen == "lobby" and self.client:
                     # Poll host for updates
-                    self.client.get_room_info() 
+                    data = self.client.get_room_info() 
+                    if data:
+                        self._sync_room_state(data)
                 
                 # Check message TTL
                 if self.last_msg and (time.time() - self.last_msg_time > 2.0):
@@ -359,16 +363,48 @@ class ShareTUI:
                  elif action == "back": self.screen = "lobby"; self.list_index = 0
 
     def _do_join(self, ip: str, port: int, token: str):
-        if not self.client:
-            self.client = ShareClient(self.bus)
+        """Join a room in the background."""
+        self.screen = "joining"
+        self._set_msg("Joining room...")
         
-        success = self.client.join_room(ip, port, token, self.room_manager.device_name, self.room_manager.device_id)
-        if success:
-            self.screen = "lobby"
-            self.list_index = 0
-            self.last_msg = f"Joined room at {ip}:{port}"
-        else:
-            self.last_error = "Failed to join room. check IP/Token."
+        def _target():
+            if not self.client:
+                self.client = ShareClient(self.bus)
+            
+            try:
+                success = self.client.join_room(ip, port, token, self.room_manager.device_name, self.room_manager.device_id)
+                if success:
+                    # Sync Local RoomManager to avoid "Room lost" error
+                    self.room_manager.join_room(
+                        room_id=self.client.room_id,
+                        ip=ip,
+                        port=port,
+                        token=token
+                    )
+                    self.screen = "lobby"
+                    self.list_index = 0
+                    self.last_msg = f"Joined room {self.client.room_id} at {ip}:{port}"
+                else:
+                    self._set_error("Failed to join. Check IP/Token.")
+                    self.screen = "scan_results" # Fallback
+            except Exception as e:
+                self._set_error(f"Join error: {e}")
+                self.screen = "main"
+            
+            try:
+                get_app().invalidate()
+            except: pass
+
+        threading.Thread(target=_target, daemon=True).start()
+
+    def _join_from_qr(self, data: str):
+        """Parse QR/Invite data and join."""
+        try:
+            from .qr import parse_qr_data
+            room_info = parse_qr_data(data)
+            self._do_join(room_info['ip'], room_info['port'], room_info['token'])
+        except Exception as e:
+            self._set_error(f"Invalid Invite Link: {e}")
 
     def _scan_rooms(self):
         """Scan for available rooms and show results."""
@@ -555,6 +591,41 @@ class ShareTUI:
             except:
                 pass
 
+    def _sync_room_state(self, data: dict):
+        """Update local models from server data."""
+        if not self.room_manager.current_room:
+             return
+             
+        room = self.room_manager.current_room
+        
+        # Sync devices
+        if "devices" in data:
+            from .room import Device
+            new_devices = []
+            for d in data["devices"]:
+                name = d["name"]
+                # Keep the "(you)" mark for self
+                if d["device_id"] == self.room_manager.device_id:
+                     if "(you)" not in name: name += " (you)"
+                
+                dev = Device(
+                    device_id=d["device_id"],
+                    name=name,
+                    ip=d["ip"],
+                    state=d["state"],
+                    current_transfer=d.get("current_transfer")
+                )
+                new_devices.append(dev)
+            room.devices = new_devices
+            
+        # Sync files
+        if "files" in data:
+            self.client.room_files = data["files"]
+            
+        try:
+            get_app().invalidate()
+        except: pass
+
 
     def _show_qr(self):
         """Show the QR code screen."""
@@ -570,6 +641,7 @@ class ShareTUI:
         elif self.screen == "qr": return self._render_qr()
         elif self.screen == "creating": return HTML(" <header>Creating Room...</header>\n\n Please wait while the server starts...")
         elif self.screen == "scanning": return HTML(" <header>Scanning for rooms...</header>\n\n Please wait (3s)...")
+        elif self.screen == "joining": return HTML(" <header>Joining room...</header>\n\n Authenticating with host...")
         elif self.screen == "scan_results": return self._render_scan_results()
         elif self.screen == "manual_join": return self._render_manual_join()
         elif self.screen == "lobby_files": return self._render_lobby_files()
