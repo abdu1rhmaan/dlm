@@ -268,44 +268,32 @@ class ShareServer:
 
     def _setup_routes(self):
         # 1. Auth Endpoint
+        @self.app.get("/")
+        async def root():
+            return {"status": "ok", "app": "dlm-share", "version": "2.0"}
+        
         @self.app.post("/auth")
         async def auth(request: Request):
             data = await request.json()
             token = data.get("token")
-            if not token:
-                raise HTTPException(status_code=400, detail="Token required")
-            
-            session = self.auth_manager.create_session(token, self.room)
-            if not session:
-                raise HTTPException(status_code=401, detail="Invalid token or expired room")
-                
-            return {"session_id": session.session_id}
-
-        # --- SETUP & JOIN FLOW ---
-        
-        @self.app.get("/invite")
-        async def invite_page(request: Request):
-            """Serve a modern invitation page with auto-auth."""
-            t = request.query_params.get("t")
-            from fastapi.responses import HTMLResponse
-            html = self._get_invite_html(token_hint=t)
-            return HTMLResponse(content=html)
+            if self.auth_manager.validate_token(token, self.room):
+                session_id = secrets.token_hex(16)
+                self.auth_manager.register_session(session_id)
+                return {"session_id": session_id}
+            raise HTTPException(status_code=401, detail="Invalid token")
 
         # 2. Dependency for protected routes
-        async def verify_session(request: Request):
-            ip = request.client.host
+        def verify_session(request: Request):
             auth_header = request.headers.get("Authorization")
             if auth_header and auth_header.startswith("Bearer "):
                  session_id = auth_header.split(" ")[1]
                  if self.auth_manager.validate_session(session_id):
-                     return session_id
+                      return session_id
             
             token = request.query_params.get("token")
             if token:
-                # 1. Check if it's a valid session ID
                 if self.auth_manager.validate_session(token):
                     return token
-                # 2. Check if it's the raw room token (XX-XXX format)
                 if self.room and secrets.compare_digest(token, self.room.token):
                     return token
                 
@@ -357,45 +345,6 @@ class ShareServer:
 
             return self.get_full_state()
 
-        @self.app.post("/room/request-download")
-        async def request_download(request: Request, session_id: str = Depends(verify_session)):
-            """Web Client registering intent to download via DLM Engine."""
-            if not session_id:
-                raise HTTPException(status_code=401, detail="Unauthorized")
-                
-            data = await request.json()
-            item_id = data.get("item_id")
-            device_id = data.get("device_id")
-            
-            # Find the file entry
-            fe = self._get_file_by_id(item_id)
-            if not fe:
-                 raise HTTPException(status_code=404, detail="File not found")
-            
-            # Queue for the device (if it exists)
-            device = self.room.get_device(device_id)
-            if device:
-                 file_info = {
-                     "action": "download",
-                     "file_id": fe.file_id,
-                     "name": fe.name,
-                     "size": fe.size_bytes,
-                     "sender_ip": self.room.host_ip,
-                     "sender_port": self.port,
-                     "is_dir": getattr(fe, 'is_dir', False)
-                 }
-                 # Only add if not already in queue
-                 if not any(t.get('file_id') == fe.file_id for t in device.pending_transfers):
-                    device.pending_transfers.append(file_info)
-                    self._notify(f"Engine transfer queued for {device.name}: {fe.name}")
-                    asyncio.create_task(self.broadcast_state())
-                 return {"status": "ok", "message": "Queued for DLM Engine"}
-            else:
-                self._notify(f"Web client {device_id} requested DLM transfer: {fe.name}")
-                return {"status": "ok", "message": "Request logged (No DLM instance detected)"}
-            
-        # 3. List Files
-
         # 3. List Files
         @self.app.get("/list")
         async def list_files(request: Request, session_id: str = Depends(verify_session)):
@@ -406,8 +355,30 @@ class ShareServer:
                 "file_id": fe.file_id,
                 "name": fe.name,
                 "size_bytes": fe.size_bytes,
-                "is_dir": getattr(fe, 'is_dir', False)
+                "is_dir": getattr(fe, 'is_dir', False),
+                "owner_id": getattr(fe, 'owner_device_id', 'HOST')
             } for fe in self.file_entries]
+
+        # 4. Explicit Leave
+        @self.app.post("/room/leave")
+        async def leave_room(request: Request, session_id: str = Depends(verify_session)):
+            """Explicitly leave the room."""
+            if not session_id:
+                raise HTTPException(status_code=401, detail="Unauthorized")
+            
+            data = await request.json()
+            device_id = data.get("device_id")
+            if not device_id:
+                raise HTTPException(status_code=400, detail="device_id required")
+            
+            if self.room:
+                # If host is leaving, we might want to notify or trigger handover
+                # For now, just remove
+                self.room.remove_device(device_id)
+                self._notify(f"Device left: {device_id}")
+                asyncio.create_task(self.broadcast_state())
+            
+            return {"status": "ok"}
 
         # 4. Download File
         @self.app.get("/download/{file_id}")
@@ -959,15 +930,6 @@ dlm share join --ip {host} --port {port} --token {token}
 """
         return script
 
-    def _get_invite_html(self, token_hint: str = None) -> str:
-        """Serve the Retro Terminal Web Client fully wired to the backend."""
-        room_id = self.room.room_id if self.room else "N/A"
-        token = self.room.token if self.room else "N/A"
-        host = self.room.host_ip if self.room else "N/A"
-        port = self.port
-        
-        # Bash script payload for JS
-        bash_payload = self._get_join_bash("http://"+host+":"+str(port)).replace('`', '\\`').replace('$', '\\$').replace('\n', '\\n')
         
         # Auto-Auth logic
         auto_auth_js = ""
@@ -1499,17 +1461,5 @@ dlm share join --ip {host} --port {port} --token {token}
             toast.style.display = 'block';
             setTimeout(() => toast.style.display = 'none', 3000);
         });
-    }
-</script>
-</body>
-</html>
-""".replace("{room_id}", room_id).replace("{token}", token).replace("{host}", host).replace("{port}", str(port)).replace("{bash_payload}", bash_payload).replace("{auto_auth_js}", auto_auth_js)
-
-        return template
-
-    def _format_size(self, size):
-        for unit in ['B', 'KB', 'MB', 'GB']:
-            if size < 1024:
-                return f"{size:.2f} {unit}"
             size /= 1024
         return f"{size:.2f} TB"

@@ -18,12 +18,12 @@ def generate_room_qr(room_id: str, ip: str, port: int, token: str) -> str:
         
         # Encode the HTTP Invite URL as the primary payload
         data = f"http://{ip}:{port}/invite?t={token}"
-        
+        # Create QR (Small & Compact for TUI)
         qr = qrcode.QRCode(
             version=1,
             error_correction=qrcode.constants.ERROR_CORRECT_L,
-            box_size=1,
-            border=1
+            box_size=1, # Smaller blocks
+            border=1,  # Minimal border
         )
         qr.add_data(data)
         qr.make(fit=True)

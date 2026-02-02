@@ -340,8 +340,8 @@ class ShareClient:
             except Exception:
                 pass
             
-            # Wait 10 seconds between heartbeats (slightly faster for responsiveness)
-            self._stop_heartbeat.wait(10)
+            # Wait 5 seconds between heartbeats (faster for responsiveness)
+            self._stop_heartbeat.wait(5)
 
     def _handle_incoming_transfer(self, transfer: dict) -> Optional[str]:
         """Process an incoming transfer request. Returns the DL ID if started."""

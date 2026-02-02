@@ -78,6 +78,38 @@ class ShareTUI:
         self.refresh_thread = threading.Thread(target=self._refresh_loop, daemon=True)
         self.shutdown_event = threading.Event()
 
+    def cleanup(self):
+        """Robust shutdown of all share resources."""
+        self.running = False
+        self.shutdown_event.set()
+        
+        # 1. Notify server we are leaving (if participant)
+        if self.client and self.room_manager.current_room and self.room_manager.role == 'RECV':
+            try:
+                self.client.leave_room()
+            except:
+                pass
+        
+        # 2. Stop Heartbeat/Client
+        if self.client:
+            try: self.client.stop_heartbeat()
+            except: pass
+            self.client = None
+            
+        # 3. Stop Server
+        if self.server:
+            try: self.server.stop()
+            except: pass
+            self.server = None
+            
+        # 4. Stop Discovery (FIXES GHOST ROOMS)
+        try:
+            self.discovery.stop()
+        except:
+            pass
+            
+        self.room_manager.leave_room()
+
         # Phase 12: Notification & Global State
         self.show_global_progress = False
         try:
@@ -881,19 +913,21 @@ class ShareTUI:
         room = self.room_manager.current_room
         if not room: return HTML("Error: Room lost")
         
-        file_count = self._get_files_count()
-        queue_count = len([f for f in self.queue.queue if f.status == "pending"])
-        
         # --- HEADER / STATUS ---
+        pending_count = len([f for f in self.queue.queue if f.status == "pending"])
+        
         lines = [
             f" <header>DLM SHARE ROOM</header>  ID: <room-id>{room.room_id}</room-id>  |  TOKEN: <msg>{room.token}</msg>",
             f" <header>Invite:</header> <msg>http://{room.host_ip}:{room.port}/invite?t={room.token}</msg>",
-            f" Status: <msg>Lobby Active</msg>  |  Shared: <msg>{file_count}</msg>  |  Queue: <msg>{queue_count}</msg>",
+            f" Status: <msg>Lobby Active</msg>  |  Queue: <msg>{pending_count}</msg>",
             " " + "─"*60
         ]
         
         # --- TOTAL PROGRESS (Unified) ---
-        active_transfers = [d.current_transfer for d in room.devices if d.current_transfer]
+        active_transfers = [
+            d.current_transfer for d in room.devices 
+            if d.current_transfer and (d.current_transfer.get('speed', 0) > 0 or d.current_transfer.get('progress', 0) > 0)
+        ]
         if active_transfers:
             total_prog = sum(t.get('progress', 0) for t in active_transfers) / len(active_transfers)
             total_speed = sum(t.get('speed', 0.0) for t in active_transfers)
@@ -917,17 +951,18 @@ class ShareTUI:
                 status_txt = f"[{d.state}]"
                 lines.append(f"  <{style}>{active_mark} {d.name[:18]:<18} {status_txt:<12} {d.ip}</{style}>")
                 
-                if d.current_transfer:
+                if d.current_transfer and d.is_active():
                     t = d.current_transfer
                     prog = t.get('progress', 0)
-                    name = t.get('name', 'file')
                     speed = t.get('speed', 0.0)
                     
-                    # Mini progress bar
-                    width = 20
-                    filled = int(prog / 100 * width)
-                    bar = "█" * filled + "░" * (width - filled)
-                    lines.append(f"      <msg>└ {name[:25]:<25} [{bar}] {prog:.1f}% ({speed:.1f} MB/s)</msg>")
+                    if speed > 0 or prog > 0:
+                        name = t.get('name', 'file')
+                        # Mini progress bar
+                        width = 20
+                        filled = int(prog / 100 * width)
+                        bar = "█" * filled + "░" * (width - filled)
+                        lines.append(f"      <msg>└ {name[:25]:<25} [{bar}] {prog:.1f}% ({speed:.1f} MB/s)</msg>")
 
         lines.append(" " + "─"*50)
         
@@ -1014,21 +1049,29 @@ def run_share_tui(bus):
         tui = ShareTUI(run_share_tui._room_manager, bus)
         tui.run()
     except KeyboardInterrupt:
-        # Phase 21: Explicit leave for participants on Ctrl+C
-        rm = getattr(run_share_tui, '_room_manager', None)
-        if rm and rm.current_room and rm.role == 'RECV':
-             try:
-                 from .client import ShareClient
-                 client = ShareClient(bus)
-                 client.leave_room(
-                     rm.current_room['host_ip'], 
-                     rm.current_room['port'], 
-                     rm.current_room['token']
-                 )
-             except: pass
+        # Phase 21 & 23: Global cleanup on exit
+        try:
+            if 'tui' in locals():
+                tui.cleanup()
+            else:
+                rm = getattr(run_share_tui, '_room_manager', None)
+                if rm and rm.current_room and rm.role == 'RECV':
+                     from .client import ShareClient
+                     client = ShareClient(bus)
+                     client.leave_room(
+                         rm.current_room.host_ip, 
+                         rm.current_room.port, 
+                         rm.current_room.token
+                     )
+        except: pass
         return
     except Exception as e:
         import traceback
+        # Attempt cleanup even on crash
+        try:
+            if 'tui' in locals(): tui.cleanup()
+        except: pass
+        
         print(f"\n❌ \033[1;31mSHARE TUI CRASHED\033[0m")
         print(f"Error: {e}")
         # Write to a log file for diagnosis
