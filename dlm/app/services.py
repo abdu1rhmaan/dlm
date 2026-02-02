@@ -293,14 +293,36 @@ class DownloadService:
         [ENGINE] المحرك المسؤول عن إدارة طابور المهام.
         """
         with self._lock:
-            while self._get_active_count() < self.concurrency_limit:
+            while True:
+                # [SHARE-PRIORITY] Phase 14: Prioritize share tasks (ephemeral, high speed)
+                # We check batch_queue for any 'share' task and move it to the front if found
+                # Or just start it immediately bypassing concurrency.
+                
+                # 1. Identify high-priority share tasks in queue
+                # We search the whole batch_queue for a share task
+                share_idx = -1
+                for i, tid in enumerate(self._batch_queue):
+                    dl = self.repository.get(tid)
+                    if dl and dl.source == 'share':
+                        share_idx = i
+                        break
+                
                 download_id = None
+                if share_idx != -1:
+                    # Found a share task! Pop it regardless of position
+                    # This effectively implements a priority queue for share tasks
+                    download_id = self._batch_queue[share_idx]
+                    del self._batch_queue[share_idx]
+                    # Share tasks BYPASS concurrency entirely
+                elif self._get_active_count() >= self.concurrency_limit:
+                    # Only break if no share tasks AND at capacity
+                    break
+                else:
+                    # 2. Standard Batch Queue pop
+                    if self._batch_queue:
+                        download_id = self._batch_queue.popleft()
                 
-                # 1. Try Batch Queue first
-                if self._batch_queue:
-                    download_id = self._batch_queue.popleft()
-                
-                # 2. If Batch Queue empty, check for WAITING tasks in DB
+                # 3. If Batch Queue empty, check for WAITING tasks in DB
                 if not download_id:
                     waiting_tasks = [d.id for d in self.repository.get_all() if d.state == DownloadState.WAITING]
                     if waiting_tasks:
@@ -1595,6 +1617,10 @@ class DownloadService:
             buffer_bytes = 0
             
             with open(target_file, 'wb', buffering=buffer_size) as f:
+                # [SHARE-SYNC] Ensure segments are ready for progress tracking
+                if not dl.segments and dl.total_size > 0:
+                    self._initialize_segments(dl)
+                
                 for chunk in response.iter_content(chunk_size=chunk_size):
                     if cancel_event.is_set():
                         dl.state = DownloadState.PAUSED
@@ -1604,8 +1630,16 @@ class DownloadService:
                     if chunk:
                         # Add to buffer
                         chunk_buffer.append(chunk)
-                        buffer_bytes += len(chunk)
-                        downloaded_bytes += len(chunk)
+                        chunk_len = len(chunk)
+                        buffer_bytes += chunk_len
+                        downloaded_bytes += chunk_len
+                        
+                        # [PROGRESS-SYNC] Update Segment 0 for Monitor & TUI
+                        if dl.segments:
+                            dl.segments[0].downloaded_bytes = downloaded_bytes
+                        else:
+                            # Fallback if segments missing
+                            dl._downloaded_bytes_override = downloaded_bytes
                         
                         # Write buffer when threshold reached
                         if buffer_bytes >= buffer_size:
@@ -1628,6 +1662,9 @@ class DownloadService:
                             # Calculate smoothed speed (average of window)
                             smoothed_speed = sum(speed_window) / len(speed_window) if speed_window else 0
                             
+                            # Update dl speed for monitor/db
+                            dl.speed_bps = smoothed_speed
+                            
                             # Emit progress update with smoothed speed
                             from dlm.app.commands import UpdateExternalTask
                             if hasattr(self, 'bus') and self.bus:
@@ -1636,6 +1673,9 @@ class DownloadService:
                                     downloaded_bytes=downloaded_bytes,
                                     speed=smoothed_speed
                                 ))
+                            
+                            # Periodically save state to DB for TUI lobby
+                            self.repository.save(dl)
                             
                             last_update_time = current_time
                             last_update_bytes = downloaded_bytes

@@ -18,6 +18,7 @@ import secrets
 from .models import FileEntry
 from .auth import AuthManager
 from .room import Room, Device
+from dlm.app.commands import ShareNotify, UpdateExternalTask
 
 class ConnectionManager:
     def __init__(self):
@@ -81,6 +82,13 @@ class ShareServer:
         async def ping():
             return {"status": "ok", "host": socket.gethostname()}
             
+    def _notify(self, msg: str, is_error: bool = False):
+        """Send notification via bus."""
+        try:
+            self.bus.handle(ShareNotify(message=msg, is_error=is_error))
+        except:
+             print(f"{'[ERR] ' if is_error else ''}{msg}")
+
     async def broadcast_state(self):
         """Broadcast full room state to all WS clients."""
         if not self.room: return
@@ -241,7 +249,6 @@ class ShareServer:
         self.current_speed = speed
 
         if self.bus and self.upload_task_id:
-            from dlm.app.commands import UpdateExternalTask
             self.bus.handle(UpdateExternalTask(
                 id=self.upload_task_id,
                 downloaded_bytes=bytes_sent,
@@ -334,7 +341,7 @@ class ShareServer:
                         state="idle"
                     )
                     self.room.add_device(new_dev)
-                    print(f"[WEB] New client joined: {device_name} ({ip})")
+                    self._notify(f"Web browser joined: {ip}")
                     asyncio.create_task(self.broadcast_state())
 
             return self.get_full_state()
@@ -344,8 +351,7 @@ class ShareServer:
             """Web Client registering intent to download."""
             data = await request.json()
             item_id = data.get("item_id")
-            # We can log this or notify TUI
-            print(f"[WEB] Client requested download: {item_id}")
+            self._notify(f"Web client requested download: {item_id}")
             return {"status": "ok"}
             
         # 3. List Files
@@ -382,10 +388,9 @@ class ShareServer:
                 "Accept-Ranges": "bytes"
             }
             
-            print(f"[INFO] Transfer started: {fe.name} -> {request.client.host}")
+            self._notify(f"Transfer started: {fe.name} -> {request.client.host}")
             
             if self.bus and self.upload_task_id:
-                 from dlm.app.commands import UpdateExternalTask
                  self.bus.handle(UpdateExternalTask(
                      id=self.upload_task_id,
                      state="DOWNLOADING"
@@ -742,24 +747,17 @@ class ShareServer:
         except Exception:
             pass
         
-        # Method 3: Socket trick (last resort before hostname)
-        # This can return incorrect IPs on some configurations
+        # Method 3: Socket trick (robust version)
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
+            # Use a dummy address that doesn't actually send packets
+            s.connect(("10.255.255.255", 1))
             ip = s.getsockname()[0]
             s.close()
             
-            # STRICT validation: Only accept if it's a valid LAN IP
-            if ip.startswith('192.168.') or ip.startswith('10.'):
-                return ip
-            elif ip.startswith('172.'):
-                try:
-                    second_octet = int(ip.split('.')[1])
-                    if 16 <= second_octet <= 31:
-                        return ip
-                except (ValueError, IndexError):
-                    pass
+            # Avoid docker/bridge/localhost bridge IPs if possible
+            if not ip.startswith('127.') and not ip.startswith('172.17.'):
+                 return ip
         except Exception:
             pass
         
@@ -843,245 +841,313 @@ dlm share join --ip {host} --port {port} --token {token}
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>DLM SHARE :: TERMINAL</title>
+    <title>DLM // DASHBOARD</title>
     <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
+        
         :root {{
-            --bg: #000000;
-            --fg: #00ff00;
-            --dim: #005500;
-            --border: #00ff00;
-            --font: 'Courier New', Courier, monospace;
+            --bg: #0a0a0a;
+            --fg: #f0f0f0;
+            --accent: #00ff41; /* Matrix/Terminal Green */
+            --dim: #008f11;
+            --border: #444;
+            --header-bg: #1a1a1a;
+            --box-bg: #0d0d0d;
+            --font: 'JetBrains Mono', 'Courier New', monospace;
         }}
-        * {{ box-sizing: border-box; }}
+        
+        * {{ box-sizing: border-box; outline: none; }}
+        
         body {{
             background-color: var(--bg);
             color: var(--fg);
             font-family: var(--font);
             margin: 0;
-            padding: 15px;
-            font-size: 14px;
-            overflow-x: hidden;
-            border: 4px double var(--dim);
-            min-height: 100vh;
+            padding: 20px;
+            font-size: 13px;
+            line-height: 1.5;
+            display: flex;
+            justify-content: center;
         }}
         
-        .header {{ 
+        .dashboard {{
             width: 100%;
-            text-align: center; 
-            border-bottom: 2px solid var(--dim); 
-            padding-bottom: 10px; 
-            margin-bottom: 20px;
-        }}
-        h1 {{ margin: 0; font-size: 22px; letter-spacing: 2px; }}
-
-        .container {{
+            max-width: 1200px;
             display: grid;
-            grid-template-columns: 350px 1fr;
-            gap: 15px;
-            max-width: 1300px;
-            margin: 0 auto;
+            grid-template-columns: 320px 1fr;
+            grid-template-rows: auto 1fr;
+            gap: 20px;
         }}
         
         @media (max-width: 900px) {{
-            .container {{ grid-template-columns: 1fr; }}
+            .dashboard {{ grid-template-columns: 1fr; }}
+            body {{ padding: 10px; }}
         }}
 
-        /* Retro Boxes */
-        .box {{
-            border: 1px solid var(--dim);
-            padding: 12px;
-            position: relative;
-            background: #000;
-            margin-bottom: 15px;
-        }}
-        .box-title {{
-            position: absolute;
-            top: -9px;
-            left: 10px;
-            background: var(--bg);
-            padding: 0 5px;
-            font-weight: bold;
-            font-size: 12px;
-            color: var(--fg);
-            text-transform: uppercase;
-        }}
-
-        .stat-line {{ display: flex; justify-content: space-between; margin-bottom: 8px; }}
-        .label {{ color: var(--dim); }}
-        .value {{ color: var(--fg); font-weight: bold; }}
-
-        /* Lists */
-        .list-container {{
-            max-height: 400px;
-            overflow-y: auto;
-        }}
-        .list-item {{
-            padding: 8px 6px;
-            border-bottom: 1px dotted var(--dim);
+        /* Typography & Elements */
+        h1, h2, h3 {{ margin: 0; text-transform: uppercase; letter-spacing: 1px; }}
+        .dim {{ color: var(--dim); }}
+        .header-block {{ 
+            grid-column: 1 / -1; 
+            padding: 15px; 
+            background: var(--header-bg); 
+            border: 1px solid var(--border);
             display: flex;
             justify-content: space-between;
             align-items: center;
         }}
-        .list-item:hover {{ background: #001100; }}
-        .list-item:last-child {{ border-bottom: none; }}
-        .item-info {{ flex: 1; }}
-        .item-name {{ font-weight: bold; display: block; overflow: hidden; text-overflow: ellipsis; }}
-        .item-sub {{ font-size: 11px; color: var(--dim); }}
         
-        .status-dot {{
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            display: inline-block;
-            margin-right: 5px;
+        /* Terminal Boxes */
+        .box {{
+            background: var(--box-bg);
+            border: 1px solid var(--border);
+            position: relative;
+            padding: 25px 15px 15px 15px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
         }}
-        .status-active {{ background: #00ff00; box-shadow: 0 0 5px #00ff00; }}
-        .status-idle {{ background: var(--dim); }}
+        .box::before {{
+            content: attr(data-title);
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 20px;
+            background: var(--border);
+            color: #000;
+            font-weight: bold;
+            font-size: 10px;
+            padding: 2px 10px;
+            text-transform: uppercase;
+        }}
 
-        /* Buttons */
-        .btn {{
-            background: transparent;
-            border: 1px solid var(--fg);
-            color: var(--fg);
-            padding: 6px 14px;
-            font-family: var(--font);
-            font-size: 12px;
-            cursor: pointer;
-            text-decoration: none;
-            display: inline-block;
-            transition: 0.2s;
-        }}
-        .btn:hover {{ background: var(--fg); color: #000; }}
-        .btn-large {{ width: 100%; padding: 12px; margin-top: 10px; font-weight: bold; text-align: center; border-width: 2px; }}
-        .btn-termux {{ border-color: #00aaff; color: #00aaff; }}
-        .btn-termux:hover {{ background: #00aaff; color: #000; }}
+        /* Info Grid */
+        .info-row {{ display: flex; justify-content: space-between; margin-bottom: 8px; border-bottom: 1px dashed #222; padding-bottom: 4px; }}
+        .info-label {{ font-weight: bold; color: var(--accent); }}
 
-        /* PROGRESS */
-        .pipeline-container {{
-            grid-column: 1 / -1;
-            display: none; 
-        }}
-        .progress-bar-outer {{
-            width: 100%;
-            height: 30px;
-            border: 1px solid var(--fg);
-            margin-top: 10px;
+        /* Live Monitor */
+        .monitor {{ border-color: var(--accent); }}
+        .progress-container {{
+            margin-top: 15px;
+            border: 1px solid var(--dim);
+            height: 24px;
             position: relative;
             background: #001100;
+            overflow: hidden;
         }}
-        .progress-bar-fill {{
+        .progress-bar {{
             height: 100%;
-            background: var(--fg);
+            background: linear-gradient(90deg, var(--dim), var(--accent));
             width: 0%;
-            transition: width 0.5s ease;
+            transition: width 0.3s ease;
         }}
         .progress-text {{
             position: absolute;
             top: 0; left: 0; width: 100%; height: 100%;
-            display: flex; justify-content: center; align-items: center;
-            color: #fff; text-shadow: 1px 1px 0 #000;
-            font-weight: bold; font-size: 16px;
+            display: flex; align-items: center; justify-content: center;
+            font-weight: bold; color: #fff;
+            mix-blend-mode: difference;
         }}
+
+        /* Buttons and Inputs */
+        .btn {{
+            background: var(--accent);
+            color: #000;
+            border: none;
+            padding: 10px 15px;
+            font-family: var(--font);
+            font-weight: bold;
+            text-transform: uppercase;
+            cursor: pointer;
+            width: 100%;
+            margin-top: 10px;
+            transition: 0.1s;
+        }}
+        .btn:hover {{ background: #fff; }}
+        .btn-secondary {{ 
+            background: transparent; 
+            border: 1px solid var(--accent); 
+            color: var(--accent); 
+        }}
+        .btn-secondary:hover {{ background: var(--accent); color: #000; }}
+
+        /* Lists & Tables */
+        .list-container {{ max-height: 350px; overflow-y: auto; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
+        th {{ text-align: left; color: var(--dim); font-size: 11px; padding: 5px; border-bottom: 1px solid var(--border); }}
+        td {{ padding: 10px 5px; border-bottom: 1px solid #1a1a1a; }}
+        
+        .status-badge {{
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 2px;
+            background: #222;
+        }}
+        .status-active {{ color: var(--accent); border: 1px solid var(--accent); }}
+
+        /* Terminal Logs at Bottom */
+        .terminal {{
+            grid-column: 1 / -1;
+            height: 120px;
+            background: #000;
+            border: 1px solid #333;
+            padding: 10px;
+            overflow-y: auto;
+            color: #ccc;
+            font-size: 11px;
+        }}
+        
+        /* QR Code Container */
+        .qr-box {{
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: #fff;
+            padding: 10px;
+            margin-top: 15px;
+            border-radius: 4px;
+        }}
+        #qr-code {{ width: 150px; height: 150px; }}
 
         #toast {{
-            position: fixed;
-            bottom: 20px;
-            left: 50%;
-            transform: translateX(-50%);
-            background: #00ff00;
-            color: #000;
-            padding: 10px 20px;
-            font-weight: bold;
-            display: none;
-            z-index: 1000;
-        }}
-
-        .terminal-logs {{
-            height: 120px;
-            background: #000500;
-            border: 1px solid #002200;
-            padding: 8px;
-            font-size: 11px;
-            overflow-y: auto;
-            color: #00aa00;
-            margin-top: 10px;
+            position: fixed; top: 20px; right: 20px;
+            background: var(--accent); color: #000;
+            padding: 12px 24px; font-weight: bold;
+            display: none; box-shadow: 0 5px 20px rgba(0,255,65,0.3);
+            z-index: 10000;
         }}
     </style>
+    <script src="https://cdn.jsdelivr.net/npm/qrcode@1.4.4/build/qrcode.min.js"></script>
 </head>
 <body onload="init()">
 
-<div id="toast">COPIED TO CLIPBOARD</div>
+<div id="toast">SYSTEM: COPIED TO CLIPBOARD</div>
 
-<div class="header">
-    <h1>DLM // SHARE TERMINAL</h1>
-    <div id="connection-status" style="color: var(--dim); font-size: 12px; margin-top:5px;">[ STATUS: CONNECTING... ]</div>
-</div>
+<div class="dashboard">
+    <div class="header-block">
+        <div>
+            <h1 id="brand">DLM // SHARE DASHBOARD</h1>
+            <div class="dim" id="connection-status">INITIALIZING SYSTEM...</div>
+        </div>
+        <div style="text-align: right">
+            <div id="clock">00:00:00</div>
+            <div class="dim">Uptime: <span id="uptime">0s</span></div>
+        </div>
+    </div>
 
-<div class="container">
-    <div>
-        <div class="box">
-            <span class="box-title">Lobby Properties</span>
-            <div class="stat-line"><span class="label">ROOM ID:</span> <span class="value" id="room-id">{room_id}</span></div>
-            <div class="stat-line"><span class="label">TOKEN:</span> <span class="value" id="room-token">{token}</span></div>
-            <div class="stat-line"><span class="label">HOST:</span> <span class="value" id="room-host">{host}:{port}</span></div>
+    <!-- Sidebar -->
+    <div class="sidebar">
+        <div class="box" data-title="System Config">
+            <div class="info-row"><span class="info-label">NODE ID:</span> <span id="room-id">{room_id}</span></div>
+            <div class="info-row"><span class="info-label">IP:</span> <span id="room-host">{host}:{port}</span></div>
+            <div class="info-row"><span class="info-label">TOKEN:</span> <span id="room-token" style="background: #222; padding: 0 4px;">{token}</span></div>
             
-            <button class="btn btn-large" onclick="copyJoinScript()">COPY JOIN SCRIPT</button>
-            <div id="android-actions" style="display: none;">
-                <a href="intent://com.termux/#Intent;scheme=termux;end" class="btn btn-large btn-termux">OPEN TERMUX</a>
+            <button class="btn" onclick="copyJoinScript()">COPY JOIN SCRIPT</button>
+            <button class="btn btn-secondary" onclick="window.location.reload()">REFRESH SYSTEM</button>
+        </div>
+
+        <div class="box" data-title="Access QR" style="margin-top: 20px;">
+            <div class="qr-box">
+                <canvas id="qr-canvas"></canvas>
+            </div>
+            <div style="text-align: center; font-size: 10px; margin-top: 8px;" class="dim">SCAN FOR AUTO-AUTH</div>
+        </div>
+    </div>
+
+    <!-- Main Content -->
+    <div class="main-panel">
+        <div class="box monitor" data-title="Live Transfer Monitor">
+            <div id="transfer-inactive" style="text-align: center; padding: 20px; color: #444;">NO ACTIVE TRANSFERS IN PIPELINE</div>
+            <div id="transfer-active" style="display: none;">
+                <div class="info-row">
+                    <span id="pipeline-file" style="font-weight: bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 70%;">--</span>
+                    <span id="pipeline-speed" style="color: var(--accent);">0.0 MB/s</span>
+                </div>
+                <div class="progress-container">
+                    <div id="pipeline-bar" class="progress-bar"></div>
+                    <div id="pipeline-text" class="progress-text">0%</div>
+                </div>
+                <div style="font-size: 10px; margin-top: 4px; text-align: right;" class="dim" id="pipeline-stats">0 B / 0 B</div>
             </div>
         </div>
 
-        <div class="box">
-            <span class="box-title">Connected Nodes</span>
-            <div id="device-list" class="list-container">
-                <!-- Initial state hydrate -->
+        <div class="box" data-title="Connected Peers" style="margin-top: 20px;">
+            <div class="list-container">
+                <table id="device-table">
+                    <thead>
+                        <tr>
+                            <th>NODE NAME</th>
+                            <th>ENDPOINT</th>
+                            <th>STATUS</th>
+                             <th>ACTIVITY</th>
+                        </tr>
+                    </thead>
+                    <tbody id="device-list">
+                        <!-- Redrawn by state -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="box" data-title="Shared Directory" style="margin-top: 20px;">
+            <div class="list-container">
+                <table id="file-table">
+                    <thead>
+                        <tr>
+                            <th>FILENAME</th>
+                            <th>SIZE</th>
+                            <th>ACTION</th>
+                        </tr>
+                    </thead>
+                    <tbody id="file-list">
+                        <!-- Redrawn by state -->
+                    </tbody>
+                </table>
             </div>
         </div>
     </div>
 
-    <div>
-        <div id="pipeline" class="box pipeline-container">
-            <span class="box-title">Transfer Pipeline</span>
-            <div class="stat-line"><span class="label">FILE:</span> <span class="value" id="pipeline-file">--</span></div>
-            <div class="stat-line"><span class="label">SPEED:</span> <span class="value" id="pipeline-speed">0.0 MB/s</span></div>
-            <div class="progress-bar-outer">
-                <div id="pipeline-fill" class="progress-bar-fill"></div>
-                <div id="pipeline-text" class="progress-text">0%</div>
-            </div>
-        </div>
-
-        <div class="box">
-            <span class="box-title">Shared Directory</span>
-            <div id="file-list" class="list-container">
-                <!-- Initial state hydrate -->
-            </div>
-        </div>
-
-        <div class="box">
-            <span class="box-title">System Logs</span>
-            <div id="logs" class="terminal-logs">
-                [SYS] Terminal Session Initialized.<br>
-            </div>
-        </div>
+    <div class="terminal" id="terminal">
+        [SYS] DLM Share Engine v2.0 Initialized.<br>
+        [SYS] Awaiting WebSocket handshake...<br>
     </div>
 </div>
 
 <script>
     let ws;
+    let startTime = Date.now();
     {auto_auth_js}
 
-    function log(msg) {{
-        const logs = document.getElementById('logs');
-        logs.innerHTML += `[${{new Date().toLocaleTimeString()}}] ${{msg}}<br>`;
-        logs.scrollTop = logs.scrollHeight;
+    function log(msg, type='SYS') {{
+        const term = document.getElementById('terminal');
+        const time = new Date().toLocaleTimeString();
+        const color = type === 'ERR' ? '#ff3e3e' : (type === 'OK' ? '#00ff41' : '#ccc');
+        term.innerHTML += `[<span style="color:${{color}}">${{type}}</span>] [${{time}}] ${{msg}}<br>`;
+        term.scrollTop = term.scrollHeight;
     }}
 
     function init() {{
-        if (navigator.userAgent.toLowerCase().includes('android')) {{
-            document.getElementById('android-actions').style.display = 'block';
-        }}
+        setInterval(() => {{
+            document.getElementById('clock').innerText = new Date().toLocaleTimeString();
+            document.getElementById('uptime').innerText = Math.floor((Date.now() - startTime)/1000) + 's';
+        }}, 1000);
+        
+        generateQR();
         connectWS();
         hydrate();
+    }}
+
+    function generateQR() {{
+        const canvas = document.getElementById('qr-canvas');
+        const url = window.location.href;
+        QRCode.toCanvas(canvas, url, {{
+            margin: 1,
+            width: 150,
+            color: {{
+                dark: '#000000',
+                light: '#ffffff'
+            }}
+        }}, (err) => {{
+            if (err) console.error(err);
+        }});
     }}
 
     function connectWS() {{
@@ -1089,9 +1155,9 @@ dlm share join --ip {host} --port {port} --token {token}
         ws = new WebSocket(`${{protocol}}//${{window.location.host}}/ws`);
         
         ws.onopen = () => {{
-            document.getElementById('connection-status').style.color = '#00ff00';
-            document.getElementById('connection-status').innerText = '[ STATUS: CONNECTED ]';
-            log("WebSocket Connection Established.");
+            document.getElementById('connection-status').style.color = 'var(--accent)';
+            document.getElementById('connection-status').innerText = 'STATUS: ONLINE // ENCRYPTED';
+            log("WebSocket link established.", "OK");
         }};
 
         ws.onmessage = (e) => {{
@@ -1104,9 +1170,9 @@ dlm share join --ip {host} --port {port} --token {token}
         }};
 
         ws.onclose = () => {{
-            document.getElementById('connection-status').style.color = '#ff0000';
-            document.getElementById('connection-status').innerText = '[ STATUS: DISCONNECTED ]';
-            log("WebSocket Disconnected. Reconnecting...");
+            document.getElementById('connection-status').style.color = '#ff3e3e';
+            document.getElementById('connection-status').innerText = 'STATUS: OFFLINE // RETRYING';
+            log("Signal lost. Re-establishing...", "ERR");
             setTimeout(connectWS, 2000);
         }};
     }}
@@ -1124,18 +1190,18 @@ dlm share join --ip {host} --port {port} --token {token}
             if (token) url.searchParams.set('token', token);
             url.searchParams.set('register', 'true');
             url.searchParams.set('device_id', devId);
-            url.searchParams.set('device_name', 'Web Browser');
+            url.searchParams.set('device_name', 'Web Client');
 
             const res = await fetch(url);
             if (res.ok) {{
                 const data = await res.json();
                 renderState(data);
-                log("Hydrated & Registered as " + devId);
+                log("Session authorized. ID: " + devId, "OK");
             }} else {{
-                log("Hydration failed (Status: " + res.status + "). Check token.");
+                log("Authorization failed (" + res.status + "). Check token.", "ERR");
             }}
         }} catch(e) {{
-            log("Hydration failed: Network Error.");
+            log("Network failure during handshake.", "ERR");
         }}
     }}
 
@@ -1147,57 +1213,66 @@ dlm share join --ip {host} --port {port} --token {token}
         // Devices
         const devList = document.getElementById('device-list');
         devList.innerHTML = '';
-        state.devices.forEach(d => {{
-            const item = document.createElement('div');
-            item.className = 'list-item';
-            const statusClass = d.is_active ? 'status-active' : 'status-idle';
-            item.innerHTML = `
-                <div class="item-info">
-                    <span class="item-name"><span class="status-dot ${{statusClass}}"></span>${{d.name}}</span>
-                    <span class="item-sub">${{d.ip}} | ${{d.state}}</span>
-                </div>
-            `;
-            devList.appendChild(item);
-        }});
+        if (state.devices.length === 0) {{
+             devList.innerHTML = '<tr><td colspan="4" style="text-align:center" class="dim">No active peers found</td></tr>';
+        }} else {{
+            state.devices.forEach(d => {{
+                const row = document.createElement('tr');
+                const badge = d.is_active ? '<span class="status-badge status-active">ACTIVE</span>' : '<span class="status-badge">IDLE</span>';
+                row.innerHTML = `
+                    <td>${{d.name}}</td>
+                    <td>${{d.ip}}</td>
+                    <td>${{badge}}</td>
+                    <td class="dim" style="font-size:10px">${{d.state.toUpperCase()}}</td>
+                `;
+                devList.appendChild(row);
+            }});
+        }}
 
         // Files
         const fileList = document.getElementById('file-list');
         fileList.innerHTML = '';
         if (!state.files || state.files.length === 0) {{
-             fileList.innerHTML = '<div style="padding:20px; color:var(--dim); text-align:center;">Empty Directory</div>';
-        }} else {{
+             fileList.innerHTML = '<tr><td colspan="3" style="text-align:center" class="dim">Shared directory is empty</td></tr>';
+        } else {{
             state.files.forEach(f => {{
-                const item = document.createElement('div');
-                item.className = 'list-item';
-                item.innerHTML = `
-                    <div class="item-info">
-                        <span class="item-name">${{f.name}}</span>
-                        <span class="item-sub">${{formatSize(f.size)}}</span>
-                    </div>
-                    <button class="btn" onclick="downloadFile('${{f.id}}')">GET</button>
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td style="font-weight:bold">${{f.name}}</td>
+                    <td class="dim">${{formatSize(f.size)}}</td>
+                    <td><button class="btn btn-secondary" style="margin:0; padding:4px 10px;" onclick="downloadFile('${{f.id}}')">GET</button></td>
                 `;
-                fileList.appendChild(item);
+                fileList.appendChild(row);
             }});
         }}
 
         // Pipeline Logic (Aggregate)
         if (state.transfer && state.transfer.active) {{
-            document.getElementById('pipeline').style.display = 'block';
+            showTransferUI(true);
             document.getElementById('pipeline-speed').innerText = state.transfer.speed.toFixed(2) + " MB/s";
-            document.getElementById('pipeline-fill').style.width = state.transfer.progress.toFixed(1) + '%';
+            document.getElementById('pipeline-bar').style.width = state.transfer.progress.toFixed(1) + '%';
             document.getElementById('pipeline-text').innerText = state.transfer.progress.toFixed(1) + '%';
+        }} else {{
+             // Don't hide immediately to allow "100%" to be seen
         }}
     }}
 
+    function showTransferUI(active) {{
+        document.getElementById('transfer-active').style.display = active ? 'block' : 'none';
+        document.getElementById('transfer-inactive').style.display = active ? 'none' : 'block';
+    }}
+
     function updateProgress(data) {{
-        document.getElementById('pipeline').style.display = 'block';
+        showTransferUI(true);
         document.getElementById('pipeline-file').innerText = data.file;
         document.getElementById('pipeline-speed').innerText = data.speed;
-        document.getElementById('pipeline-fill').style.width = data.percent.toFixed(1) + '%';
+        document.getElementById('pipeline-bar').style.width = data.percent.toFixed(1) + '%';
         document.getElementById('pipeline-text').innerText = data.percent.toFixed(1) + '%';
+        document.getElementById('pipeline-stats').innerText = data.progress_text || "";
         
         if (data.percent >= 100) {{
-             log("Downloaded: " + data.file);
+             log("Packet transfer complete: " + data.file, "OK");
+             setTimeout(() => showTransferUI(false), 5000);
         }}
     }}
 
@@ -1217,7 +1292,7 @@ dlm share join --ip {host} --port {port} --token {token}
         }}).then(() => {{
             const token = localStorage.getItem('dlm_token');
             window.location.href = `/download/${{id}}${{token ? '?token=' + token : ''}}`;
-            log("Download Request Sent.");
+            log("Requesting file entry: " + id);
         }});
     }}
 
@@ -1227,7 +1302,7 @@ dlm share join --ip {host} --port {port} --token {token}
         navigator.clipboard.writeText(script).then(() => {{
             const toast = document.getElementById('toast');
             toast.style.display = 'block';
-            setTimeout(() => toast.style.display = 'none', 2000);
+            setTimeout(() => toast.style.display = 'none', 3000);
         }});
     }}
 </script>

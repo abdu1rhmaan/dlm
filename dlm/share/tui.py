@@ -76,6 +76,25 @@ class ShareTUI:
         
         # Background refreshing
         self.refresh_thread = threading.Thread(target=self._refresh_loop, daemon=True)
+        self.shutdown_event = threading.Event()
+
+        # Phase 12: Notification & Global State
+        self.show_global_progress = False
+        try:
+            from dlm.app.commands import ShareNotify
+            bus.register(ShareNotify, self._handle_share_notify)
+        except:
+            pass
+
+    def _handle_share_notify(self, command):
+        """Update notification msg/error box."""
+        if command.is_error:
+            self._set_error(command.message)
+        else:
+            self._set_msg(command.message)
+        try:
+            get_app().invalidate()
+        except: pass
 
     def _set_msg(self, msg: str):
         self.last_msg = msg
@@ -214,6 +233,13 @@ class ShareTUI:
             elif self.screen == "lobby_files":
                  # Maybe allow hiding? For now just msg
                  pass
+
+        @self.kb.add('p', filter=~Condition(lambda: get_app().layout.has_focus(self.input_field)))
+        def _(event):
+            """Toggle global progress bar."""
+            self.show_global_progress = not self.show_global_progress
+            self._set_msg(f"Global Progress: {'Visible' if self.show_global_progress else 'Hidden'}")
+            get_app().invalidate()
 
         @self.kb.add('q', filter=~Condition(lambda: get_app().layout.has_focus(self.input_field)))
         @self.kb.add('escape')
@@ -738,7 +764,23 @@ class ShareTUI:
                     t = d.current_transfer
                     prog = t.get('progress', 0)
                     name = t.get('name', 'file')
-                    lines.append(f"      <msg>└ Sending: {name[:25]} ({prog:.1f}%)</msg>")
+                    speed = t.get('speed', 0.0)
+                    
+                    # Mini progress bar
+                    width = 20
+                    filled = int(prog / 100 * width)
+                    bar = "█" * filled + "░" * (width - filled)
+                    lines.append(f"      <msg>└ {name[:25]:<25} [{bar}] {prog:.1f}% ({speed:.1f} MB/s)</msg>")
+
+        # --- GLOBAL TRANSFER SUMMARY ---
+        if self.show_global_progress:
+            active_transfers = [d.current_transfer for d in devices if d.current_transfer]
+            if active_transfers:
+                lines.append("\n <header>GLOBAL TRANSFERS</header>")
+                for t in active_transfers:
+                    prog = t.get('progress', 0)
+                    bar_str = "█"*int(prog/5) + "░"*(20-int(prog/5))
+                    lines.append(f" {t['name'][:20]:<20} <msg>[{bar_str}] {prog:>5.1f}%</msg>")
 
         lines.append(" " + "─"*50)
         

@@ -131,6 +131,11 @@ class UpdateExternalTask(Command):
     speed: float = 0.0
     state: str = None # Optional state update
 
+@dataclass
+class ShareNotify(Command):
+    message: str
+    is_error: bool = False
+
 
 
 # --- Bus ---

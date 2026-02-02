@@ -1,7 +1,7 @@
 import requests
 import sys
 import time
-from dlm.app.commands import AddDownload
+from dlm.app.commands import AddDownload, ShareNotify
 from pathlib import Path
 import threading
 from typing import Optional, List
@@ -19,6 +19,14 @@ class ShareClient:
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._stop_heartbeat = threading.Event()
         self.room_files = []
+
+    def _notify(self, msg: str, is_error: bool = False):
+        """Send notification via bus."""
+        try:
+            self.bus.handle(ShareNotify(message=msg, is_error=is_error))
+        except:
+            # Fallback to stdout if bus handler not registered
+            print(f"{'[ERR] ' if is_error else ''}{msg}")
 
     def _get_output_template(self, filename: str, overrides: str = None) -> str:
         """
@@ -71,18 +79,18 @@ class ShareClient:
             # 1. Auth via POST /auth
             resp = requests.post(f"{self.base_url}/auth", json={"token": token}, timeout=5)
             if resp.status_code != 200:
-                print(f"❌ Connection failed: {resp.text}")
+                self._notify(f"Connection failed: {resp.text}", is_error=True)
                 return
             
             data = resp.json()
             self.session_id = data.get("session_id")
-            print("✅ Connected and authenticated.")
+            self._notify("Connected and authenticated.")
             
             # 2. Get File List
             headers = {"Authorization": f"Bearer {self.session_id}"}
             resp = requests.get(f"{self.base_url}/list", headers=headers, timeout=5)
             if resp.status_code != 200:
-                print(f"❌ Failed to get file list: {resp.text}")
+                self._notify(f"Failed to get file list: {resp.text}", is_error=True)
                 return
             
             files = resp.json()
@@ -121,25 +129,23 @@ class ShareClient:
             ))
             
             if dl_id:
-                # print(f"🚀 Initializing download (ID: {dl_id})...") # Reduced noise
                 from dlm.app.commands import StartDownload
                 self.bus.handle(StartDownload(id=dl_id))
                 
-                # [SHARE-FIX] Force queue processing to start immediately
                 try:
                     from dlm.app.commands import ProcessQueue
                     self.bus.handle(ProcessQueue())
                 except:
-                    pass  # ProcessQueue might not exist in older versions
+                    pass
                 
-                print(f"✅ Download started! Check progress with 'ls' command.")
+                self._notify(f"Download started! Check progress with 'ls' command.")
             else:
-                print("❌ Failed to add download to queue.")
+                self._notify("Failed to add download to queue.", is_error=True)
         
         except requests.exceptions.RequestException as e:
-            print(f"❌ Connection error: {e}")
+            self._notify(f"Connection error: {e}", is_error=True)
         except Exception as e:
-            print(f"❌ Unexpected error: {e}")
+            self._notify(f"Unexpected error: {e}", is_error=True)
     
     # Phase 2: Room methods
     def join_room(self, ip: str, port: int, token: str, device_name: str, device_id: str = None) -> bool:
