@@ -9,7 +9,10 @@ from pathlib import Path
 class QueuedFile:
     """Represents a file in the transfer queue."""
     file_path: Path
-    target_devices: List[str]  # Device IDs to send to
+    # Phase 2 Targeting
+    target_devices: List[str] = field(default_factory=lambda: ["ALL"])
+    added_by: str = "local"
+    
     status: str = "pending"  # pending, transferring, completed, failed, skipped
     progress: float = 0.0
     error: Optional[str] = None
@@ -35,18 +38,40 @@ class TransferQueue:
         self.queue: List[QueuedFile] = []
         self.current_index: int = 0
     
-    def add_file(self, file_path: Path, target_devices: List[str]):
-        """Add file to queue."""
+    def add_path(self, path: Path, target_devices: List[str] = None):
+        """Add file or folder (recursively) to queue."""
+        if target_devices is None:
+            target_devices = ["ALL"]
+            
+        if path.is_file():
+            self._add_single_file(path, target_devices)
+            return 1
+        elif path.is_dir():
+            count = 0
+            for p in path.rglob("*"):
+                if p.is_file():
+                    self._add_single_file(p, target_devices)
+                    count += 1
+            return count
+        return 0
+
+    def _add_single_file(self, file_path: Path, target_devices: List[str]):
+        # Prevent duplicates in current queue
+        if any(f.file_path == file_path for f in self.queue):
+            return
+            
         queued_file = QueuedFile(
             file_path=file_path,
-            target_devices=target_devices
+            target_devices=list(target_devices)
         )
         self.queue.append(queued_file)
     
-    def add_files(self, file_paths: List[Path], target_devices: List[str]):
-        """Add multiple files to queue."""
-        for file_path in file_paths:
-            self.add_file(file_path, target_devices)
+    def remove_item(self, index: int):
+        """Remove item by index."""
+        if 0 <= index < len(self.queue):
+            self.queue.pop(index)
+            if self.current_index > 0 and self.current_index > index:
+                self.current_index -= 1
     
     def get_current(self) -> Optional[QueuedFile]:
         """Get current file being transferred."""
@@ -83,20 +108,13 @@ class TransferQueue:
     
     def is_complete(self) -> bool:
         """Check if all files are processed."""
+        # A queue is complete if there are no more 'pending' or 'transferring' items starting from current_index
         return self.current_index >= len(self.queue)
     
-    def get_pending_count(self) -> int:
-        """Get number of pending files."""
-        return sum(1 for f in self.queue if f.status == "pending")
-    
-    def get_completed_count(self) -> int:
-        """Get number of completed files."""
-        return sum(1 for f in self.queue if f.status == "completed")
-    
-    def get_failed_count(self) -> int:
-        """Get number of failed files."""
-        return sum(1 for f in self.queue if f.status == "failed")
-    
+    def get_pending_items(self) -> List[QueuedFile]:
+        """Get all pending files."""
+        return [f for f in self.queue[self.current_index:] if f.status == "pending"]
+
     def clear(self):
         """Clear the queue."""
         self.queue = []

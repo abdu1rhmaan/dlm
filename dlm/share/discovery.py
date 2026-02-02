@@ -57,7 +57,7 @@ class RoomDiscovery:
         
         return "127.0.0.1"
     
-    def advertise_room(self, room_id: str, token: str, port: int) -> bool:
+    def advertise_room(self, room_id: str, token: str, port: int, device_id: str = "HOST") -> bool:
         """
         Advertise room on LAN via mDNS.
         
@@ -65,6 +65,7 @@ class RoomDiscovery:
             room_id: 4-character room ID
             token: XXX-XXX format token
             port: Server port
+            device_id: Unique device ID
         
         Returns:
             True if advertisement successful, False otherwise
@@ -86,13 +87,14 @@ class RoomDiscovery:
                     b'room_id': room_id.encode('utf-8'),
                     b'token': token.encode('utf-8'),
                     b'version': b'2.0',
-                    b'hostname': hostname.encode('utf-8')
+                    b'hostname': hostname.encode('utf-8'),
+                    b'device_id': device_id.encode('utf-8')
                 },
                 server=f"{hostname}.local."
             )
             
             self.zeroconf.register_service(self.service_info)
-            logger.info(f"Room {room_id} advertised on {local_ip}:{port}")
+            logger.info(f"Room {room_id} advertised on {local_ip}:{port} (Device: {device_id})")
             return True
         
         except Exception as e:
@@ -128,6 +130,7 @@ class RoomDiscovery:
                             room_id = info.properties.get(b'room_id', b'').decode('utf-8')
                             token = info.properties.get(b'token', b'').decode('utf-8')
                             hostname = info.properties.get(b'hostname', b'Unknown').decode('utf-8')
+                            device_id = info.properties.get(b'device_id', b'HOST').decode('utf-8')
                             
                             room_data = {
                                 'room_id': room_id,
@@ -135,6 +138,7 @@ class RoomDiscovery:
                                 'ip': socket.inet_ntoa(info.addresses[0]),
                                 'port': info.port,
                                 'hostname': hostname,
+                                'device_id': device_id,
                                 'service_name': name
                             }
                             

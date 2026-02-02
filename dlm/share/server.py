@@ -17,7 +17,7 @@ class ShareServer:
         self.app = FastAPI(title="dlm-share")
         self.auth_manager = AuthManager()
         
-        # Handle both single FileEntry (Phase 1 legacy) and List[FileEntry] (Phase 2)
+        # Phase 2: Handle multiple file entries
         if file_entries:
             if isinstance(file_entries, list):
                 self.file_entries = file_entries
@@ -35,7 +35,7 @@ class ShareServer:
         self.upload_task_id = upload_task_id
         
         self.transfer_queues = {} # Track active transfer queues
-        self._bytes_sent = 0
+        self._bytes_sent = {} # Track bytes sent per file/device
         self._lock = threading.Lock()
         self._last_update = 0
         
@@ -43,72 +43,102 @@ class ShareServer:
         self.connected_clients = set()
         
         # Add Middleware for Progress
-        # Add Middleware for Progress (Always on for share)
         self.app.middleware("http")(self.progress_middleware)
             
         self._setup_routes()
 
+    def _get_file_by_id(self, file_id: str) -> Optional[FileEntry]:
+        for fe in self.file_entries:
+            if fe.file_id == file_id:
+                return fe
+        return None
+
     async def progress_middleware(self, request: Request, call_next):
+        # Extract file_id from path if download
+        path_parts = request.url.path.strip("/").split("/")
+        is_download = len(path_parts) >= 2 and path_parts[0] == "download"
+        file_id = path_parts[1] if is_download else None
+        
         response = await call_next(request)
         
-        # Check if it's the download route
-        if "download" in request.url.path:
-             # Wrap the streaming response
-             async def wrapped_iterator(original_iterator):
-                 import time
-                 try:
-                     async for chunk in original_iterator:
-                         yield chunk
-                         with self._lock:
-                             self._bytes_sent += len(chunk)
-                             current_bytes = self._bytes_sent
-                         
-                         # Throttled update (every 0.5s or so?)
-                         # Or just fire-and-forget? Bus overhead?
-                         # Let's fire every 100KB or something.
-                         # Better: Check time.
-                        #  now = time.time()
-                        #  if now - self._last_update > 0.5:
-                        #      self._last_update = now
-                        #      self._update_dlm(current_bytes)
-                         # Actually, let's just update. The TUI polls. Repo updates are fast enough?
-                         # 10MB/s = 1000 updates/s if 10KB chunks. Too fast.
-                         # Update logic:
-                         self._update_dlm_throttled(current_bytes)
-                         
-                 except Exception:
-                     # Connection dropped?
-                     pass
+        if is_download and response.status_code < 400:
+             client_ip = request.client.host
+             fe = self._get_file_by_id(file_id)
              
-             # Modify response body
-             # Starlette StreamingResponse / FileResponse uses .body_iterator for async
-             if hasattr(response, 'body_iterator'):
-                 response.body_iterator = wrapped_iterator(response.body_iterator)
+             if fe:
+                 # Update device state in room if we are host
+                 if self.room:
+                     # Find device by IP (rough matching for state tracking)
+                     for d in self.room.devices:
+                         if d.ip == client_ip:
+                             d.state = "receiving"
+                             # Initialize transfer info if not there
+                             if not d.current_transfer:
+                                 d.current_transfer = {
+                                     "file_id": file_id,
+                                     "name": fe.name,
+                                     "progress": 0.0,
+                                     "speed": 0.0,
+                                     "size": fe.size_bytes
+                                 }
+                             break
+
+                 async def wrapped_iterator(original_iterator):
+                     import time
+                     bytes_sent_for_this = 0
+                     last_measure_time = time.time()
+                     last_measure_bytes = 0
+                     
+                     try:
+                         async for chunk in original_iterator:
+                             yield chunk
+                             chunk_len = len(chunk)
+                             bytes_sent_for_this += chunk_len
+                             
+                             now = time.time()
+                             if now - last_measure_time > 0.5: # Update room state every 0.5s
+                                 diff_time = now - last_measure_time
+                                 diff_bytes = bytes_sent_for_this - last_measure_bytes
+                                 speed = diff_bytes / diff_time if diff_time > 0 else 0
+                                 
+                                 progress = (bytes_sent_for_this / fe.size_bytes * 100) if fe.size_bytes > 0 else 0
+                                 
+                                 if self.room:
+                                     for d in self.room.devices:
+                                         if d.ip == client_ip and d.current_transfer and d.current_transfer['file_id'] == file_id:
+                                             d.current_transfer['progress'] = progress
+                                             d.current_transfer['speed'] = speed
+                                             d.update_heartbeat()
+                                 
+                                 last_measure_time = now
+                                 last_measure_bytes = bytes_sent_for_this
+                                 
+                                 # Switch to general throttled update for DLM Bus
+                                 self._update_dlm_throttled(bytes_sent_for_this, speed)
+                                 
+                     except Exception:
+                         pass
+                     finally:
+                         # Cleanup state
+                         if self.room:
+                             for d in self.room.devices:
+                                 if d.ip == client_ip:
+                                     d.state = "idle"
+                                     d.current_transfer = None
+                                     d.update_heartbeat()
+                 
+                 if hasattr(response, 'body_iterator'):
+                     response.body_iterator = wrapped_iterator(response.body_iterator)
         
         return response
 
-    def _update_dlm_throttled(self, bytes_sent):
+    def _update_dlm_throttled(self, bytes_sent, speed):
         import time
         now = time.time()
-        if now - self._last_update < 0.2: # Max 5 updates/sec
+        if now - self._last_update < 0.2:
             return
         self._last_update = now
         
-        # Calculate speed
-        if not hasattr(self, '_last_bytes_measure'):
-             self._last_bytes_measure = 0
-             self._last_time_measure = now
-        
-        speed = 0.0
-        time_diff = now - self._last_time_measure
-        if time_diff > 0:
-            bytes_diff = bytes_sent - self._last_bytes_measure
-            speed = bytes_diff / time_diff
-        
-        self._last_bytes_measure = bytes_sent
-        self._last_time_measure = now
-        
-        # Expose speed for local monitoring
         self.current_speed = speed
 
         if self.bus and self.upload_task_id:
@@ -132,7 +162,6 @@ class ShareServer:
             if not session:
                 raise HTTPException(status_code=401, detail="Invalid token or expired room")
                 
-            print(f"[INFO] Authenticated: {session.session_id} (New Session)")
             return {"session_id": session.session_id}
 
         # 2. Dependency for protected routes
@@ -144,91 +173,57 @@ class ShareServer:
                  if self.auth_manager.validate_session(session_id):
                      return session_id
             
-            # Log connection attempt only if failing? Or success?
-            # Too noisy if every chunk logs success. 
-            # We log initial Auth endpoint usage above.
-            return None # Return None if header auth fails, custom logic in endpoint can check query param
+            token = request.query_params.get("token")
+            if token and self.auth_manager.validate_session(token):
+                return token
+                
+            return None
 
         # 3. List Files
         @self.app.get("/list")
         async def list_files(request: Request, session_id: str = Depends(verify_session)):
             if not session_id:
-                 print(f"[INFO] Unauthorized connection attempt from {request.client.host}")
                  raise HTTPException(status_code=401, detail="Unauthorized")
             
-            # Log only once per session/list? LIST is good indicator of initial connection.
-            print(f"[INFO] Receiver connected: {request.client.host} (Listing files)")
             return [{
-                "file_id": self.file_entry.file_id,
-                "name": self.file_entry.name,
-                "size_bytes": self.file_entry.size_bytes
-            }]
+                "file_id": fe.file_id,
+                "name": fe.name,
+                "size_bytes": fe.size_bytes
+            } for fe in self.file_entries]
 
         # 4. Download File
         @self.app.get("/download/{file_id}")
-        async def download_file(file_id: str, request: Request, session_id: Optional[str] = Depends(verify_session), token: Optional[str] = None):
-            # Track Client
-            client_ip = request.client.host
-            with self._lock:
-                self.connected_clients.add(client_ip)
-
-
-            # Explicitly set Content-Length to ensure receiver can see it
-            headers = {
-                "Content-Length": str(self.file_entry.size_bytes),
-                "Accept-Ranges": "bytes"
-            }
-            
-            # Allow auth via Query param 'token' if header is missing (for dlm engine integration)
+        async def download_file(file_id: str, request: Request, session_id: Optional[str] = Depends(verify_session)):
             if not session_id:
-                if token and self.auth_manager.validate_session(token):
-                     pass
-                else:
-                     raise HTTPException(status_code=401, detail="Unauthorized")
+                 raise HTTPException(status_code=401, detail="Unauthorized")
 
-            if file_id != self.file_entry.file_id:
+            fe = self._get_file_by_id(file_id)
+            if not fe:
                 raise HTTPException(status_code=404, detail="File not found")
                 
-            path = self.file_entry.absolute_path
+            path = fe.absolute_path
             if not os.path.exists(path):
                 raise HTTPException(status_code=404, detail="File content missing")
 
-            # Support Range requests logic handled by FileResponse/Starlette
-            print(f"[INFO] Transfer started: {self.file_entry.name} -> {request.client.host}")
+            headers = {
+                "Content-Length": str(fe.size_bytes),
+                "Accept-Ranges": "bytes"
+            }
             
-            # Notify DLM that transfer started (Switch color to Pink/Active)
+            print(f"[INFO] Transfer started: {fe.name} -> {request.client.host}")
+            
             if self.bus and self.upload_task_id:
                  from dlm.app.commands import UpdateExternalTask
                  self.bus.handle(UpdateExternalTask(
                      id=self.upload_task_id,
-                     downloaded_bytes=0, # Start
                      state="DOWNLOADING"
                  ))
             
-            # Hook into response to log completion?
-            # FileResponse streams. We can subclass or use background task.
-            # Simple way: Background task runs after response sends.
-            from starlette.background import BackgroundTask
-            
-            def on_complete():
-                print(f"[INFO] Transfer completed: {self.file_entry.name}")
-                # Mark Complete in DLM Task
-                if self.bus and self.upload_task_id:
-                    from dlm.app.commands import UpdateExternalTask
-                    self.bus.handle(UpdateExternalTask(
-                        id=self.upload_task_id,
-                        downloaded_bytes=self.file_entry.size_bytes,
-                        state="COMPLETED"
-                    ))
-
-            # Allow explicit headers to be managed by FileResponse (except explicit ones we need)
-            # FileResponse handles Content-Length and Content-Range for us.
-            
             return FileResponse(
                 path, 
-                filename=self.file_entry.name,
+                filename=fe.name,
                 media_type='application/octet-stream',
-                background=BackgroundTask(on_complete)
+                headers=headers
             )
         
         # Phase 2: Room Endpoints

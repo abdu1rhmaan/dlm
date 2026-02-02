@@ -279,8 +279,28 @@ class ShareClient:
     
     def _heartbeat_loop(self):
         """Heartbeat loop to maintain presence and process pending transfers."""
+        active_share_dls = set()
+        
         while not self._stop_heartbeat.is_set():
             try:
+                # 1. Check current downloads status
+                if active_share_dls:
+                    from dlm.app.commands import ListDownloads
+                    all_dls = self.bus.handle(ListDownloads())
+                    still_active = set()
+                    for dl_id in active_share_dls:
+                        # Find the download in the list
+                        match = next((d for d in all_dls if d.id == dl_id), None)
+                        if match and match.status in ('downloading', 'pending', 'discovery'):
+                            still_active.add(dl_id)
+                    
+                    if not still_active and active_share_dls:
+                        # All shared downloads completed
+                        self.update_device_state("idle")
+                    
+                    active_share_dls = still_active
+
+                # 2. Send Heartbeat and get pending transfers
                 response = requests.post(
                     f"{self.base_url}/room/heartbeat",
                     json={"device_id": self.device_id},
@@ -293,15 +313,17 @@ class ShareClient:
                     pending = data.get("pending_transfers", [])
                     for transfer in pending:
                         if transfer.get("action") == "download":
-                            self._handle_incoming_transfer(transfer)
+                            dl_id = self._handle_incoming_transfer(transfer)
+                            if dl_id:
+                                active_share_dls.add(dl_id)
             except Exception:
                 pass
             
-            # Wait 15 seconds between heartbeats
-            self._stop_heartbeat.wait(15)
+            # Wait 10 seconds between heartbeats (slightly faster for responsiveness)
+            self._stop_heartbeat.wait(10)
 
-    def _handle_incoming_transfer(self, transfer: dict):
-        """Process an incoming transfer request."""
+    def _handle_incoming_transfer(self, transfer: dict) -> Optional[str]:
+        """Process an incoming transfer request. Returns the DL ID if started."""
         target_file = {
             "file_id": transfer["file_id"],
             "name": transfer["name"],
@@ -330,6 +352,8 @@ class ShareClient:
         if dl_id:
             self.bus.handle(StartDownload(id=dl_id))
             self.update_device_state("receiving")
+            return dl_id
+        return None
     
     def stop_heartbeat(self):
         """Stop heartbeat thread."""

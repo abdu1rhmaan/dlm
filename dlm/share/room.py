@@ -22,6 +22,9 @@ class Device:
         """Check if device is still active (seen recently)."""
         if not self.last_seen:
             return False
+        # Treat (you) as always active
+        if "(you)" in self.name:
+            return True
         return datetime.now() - self.last_seen < timedelta(seconds=timeout_seconds)
     
     def update_heartbeat(self):
