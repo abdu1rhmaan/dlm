@@ -115,6 +115,7 @@ class ShareServer:
                 }
                 for f in self.file_entries
             ],
+            "owner_device_id": self.room.owner_device_id,
             "devices": [
                 {
                     "device_id": d.device_id,
@@ -140,6 +141,16 @@ class ShareServer:
             "percent": percent,
             "speed": f"{speed_mbps:.1f} MB/s",
             "progress_text": f"{self._format_size(current_bytes)} / {self._format_size(total_bytes)}"
+        }
+        await self.ws_manager.broadcast(msg)
+
+    async def broadcast_migration(self, new_host_device_id: str, new_host_ip: str, new_host_port: int):
+        """Notify all clients to reconnect to a new host."""
+        msg = {
+            "type": "migration",
+            "new_host_id": new_host_device_id,
+            "new_host_ip": new_host_ip,
+            "new_host_port": new_host_port
         }
         await self.ws_manager.broadcast(msg)
 
@@ -458,6 +469,7 @@ class ShareServer:
                 "room_id": self.room.room_id,
                 "host_ip": self.room.host_ip,
                 "port": self.room.port,
+                "owner_id": self.room.owner_device_id,
                 "devices": [
                     {
                         "device_id": d.device_id,
@@ -476,7 +488,8 @@ class ShareServer:
                         "owner_id": fe.owner_device_id
                     }
                     for fe in self.file_entries
-                ]
+                ],
+                "migration": getattr(self, '_migrating_to', None)
             }
         
         @self.app.post("/room/join")
@@ -569,6 +582,84 @@ class ShareServer:
             
             self.room.update_device_state(device_id, state)
             asyncio.create_task(self.broadcast_state())
+            return {"status": "ok"}
+
+        @self.app.post("/room/add-file")
+        async def add_files_remote(request: Request, session_id: str = Depends(verify_session)):
+            """Allows participants to announce files they want to share."""
+            if not session_id:
+                raise HTTPException(status_code=401, detail="Unauthorized")
+                
+            data = await request.json()
+            files = data.get("files", [])
+            device_id = data.get("device_id")
+            
+            count = 0
+            for f in files:
+                fe = FileEntry(
+                    file_id=f["file_id"],
+                    name=f["name"],
+                    size_bytes=f["size"],
+                    absolute_path="", # Path is local to the participant
+                    owner_device_id=device_id,
+                    is_dir=f.get("is_dir", False)
+                )
+                # Deduplicate
+                if not any(existing.file_id == fe.file_id for existing in self.file_entries):
+                    self.file_entries.append(fe)
+                    count += 1
+            
+            if count > 0:
+                self._notify(f"Node {device_id} announced {count} new files.")
+                asyncio.create_task(self.broadcast_state())
+                
+            return {"status": "ok", "added": count}
+
+        @self.app.post("/room/handover")
+        async def handover_room(request: Request, session_id: str = Depends(verify_session)):
+            """Coordinate ownership handover to a new device."""
+            if not session_id:
+                raise HTTPException(status_code=401, detail="Unauthorized")
+            
+            data = await request.json()
+            new_owner_id = data.get("new_owner_id")
+            new_owner_ip = data.get("new_owner_ip")
+            new_owner_port = data.get("new_owner_port")
+            
+            if not new_owner_id or not new_owner_ip:
+                raise HTTPException(status_code=400, detail="Missing handover details")
+                
+            self.room.owner_device_id = new_owner_id
+            self._notify(f"Room ownership migrating to {new_owner_id}...")
+            
+            # Phase 16: Track migration for polling clients
+            self._migrating_to = {
+                "id": new_owner_id,
+                "ip": new_owner_ip,
+                "port": new_owner_port
+            }
+            
+            # Broadcast migration to all connected clients
+            asyncio.create_task(self.broadcast_migration(new_owner_id, new_owner_ip, new_owner_port))
+            
+            return {"status": "migrating"}
+
+        @self.app.post("/room/handover-ready")
+        async def handover_ready(request: Request, session_id: str = Depends(verify_session)):
+            """Called by successor when their server is up and ready."""
+            if not session_id:
+                raise HTTPException(status_code=401, detail="Unauthorized")
+            
+            data = await request.json()
+            new_host_ip = data.get("ip")
+            new_host_port = data.get("port")
+            new_host_id = data.get("device_id")
+            
+            self._notify(f"Successor {new_host_id} is READY at {new_host_ip}:{new_host_port}")
+            
+            # Final broadcast to room
+            asyncio.create_task(self.broadcast_migration(new_host_id, new_host_ip, new_host_port))
+            
             return {"status": "ok"}
 
         @self.app.post("/transfer/queue")

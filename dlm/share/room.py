@@ -18,7 +18,7 @@ class Device:
     pending_transfers: List[dict] = field(default_factory=list) # Phase 2 Coordination
     current_transfer: Optional[dict] = None # {file_id, name, progress, speed, size}
     
-    def is_active(self, timeout_seconds: int = 30) -> bool:
+    def is_active(self, timeout_seconds: int = 60) -> bool:
         """Check if device is still active (seen recently)."""
         if not self.last_seen:
             return False
@@ -41,6 +41,7 @@ class Room:
     port: int
     host_device_name: str = "Host"
     host_device_id: str = "HOST"
+    owner_device_id: str = "HOST" # Phase 16: Tracks authority for handover
     devices: List[Device] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)
     ttl: int = 3600  # 1 hour default
@@ -92,6 +93,6 @@ class Room:
             device.state = state
             device.update_heartbeat()
 
-    def prune_stale_devices(self, timeout_seconds: int = 60):
+    def prune_stale_devices(self, timeout_seconds: int = 90):
         """Remove devices not seen for a while."""
         self.devices = [d for d in self.devices if d.is_active(timeout_seconds)]

@@ -81,8 +81,9 @@ class ShareTUI:
         # Phase 12: Notification & Global State
         self.show_global_progress = False
         try:
-            from dlm.app.commands import ShareNotify
+            from dlm.app.commands import ShareNotify, TakeoverRoom
             bus.register(ShareNotify, self._handle_share_notify)
+            bus.register(TakeoverRoom, self._handle_takeover)
         except:
             pass
 
@@ -155,6 +156,25 @@ class ShareTUI:
                          # Broadcast update
                          if self.server and self.server.ws_manager and self.server.ws_manager.loop:
                              asyncio.run_coroutine_threadsafe(self.server.broadcast_state(), self.server.ws_manager.loop)
+                 except Exception:
+                     pass
+             
+             # Phase 15: If participant, announce to host
+             elif self.client and self.room_manager.current_room:
+                 try:
+                     import requests
+                     fe = FileEntry.from_path(str(path))
+                     payload = {
+                         "device_id": self.room_manager.device_id,
+                         "files": [{
+                             "file_id": fe.file_id,
+                             "name": fe.name,
+                             "size": fe.size_bytes,
+                             "is_dir": fe.is_dir
+                         }]
+                     }
+                     headers = {"Authorization": f"Bearer {self.client.session_id}"}
+                     requests.post(f"{self.client.base_url}/room/add-file", json=payload, headers=headers, timeout=5)
                  except Exception:
                      pass
                      
@@ -482,6 +502,13 @@ class ShareTUI:
              self.running = False
              get_app().exit()
         elif self.screen in ("lobby", "scan_results"):
+             # Phase 16: Handover before leaving if we are the host
+             if self.server and self.room_manager.current_room:
+                 success = self._initiate_handover()
+                 if success:
+                     self._set_msg("Handover initiated. Closing...")
+                     time.sleep(1.0) # Grace period for broadcast
+             
              self._leave_room()
         elif self.screen == "queue":
              self.screen = "lobby"; self.list_index = 0
@@ -617,6 +644,105 @@ class ShareTUI:
             except:
                 pass
 
+    def _select_successor(self) -> Optional[Any]:
+        """Find the best device to take over the room."""
+        if not self.room_manager.current_room: return None
+        room = self.room_manager.current_room
+        candidates = [d for d in room.devices if d.device_id != self.room_manager.device_id and d.is_active()]
+        if not candidates: return None
+        
+        # Count files per owner
+        file_counts = {}
+        if self.server:
+             for f in self.server.file_entries:
+                 file_counts[f.owner_device_id] = file_counts.get(f.owner_device_id, 0) + 1
+        
+        # Sort by file count then name (randomness)
+        candidates.sort(key=lambda d: (file_counts.get(d.device_id, 0), d.name), reverse=True)
+        return candidates[0]
+
+    def _initiate_handover(self) -> bool:
+        """Trigger handover process."""
+        successor = self._select_successor()
+        if not successor: return False
+        
+        # Give successor's IP a default port guess or just use 0
+        # For now, successor will notify us of their actual port via POST /room/handover-ready
+        
+        handover_info = {
+            "action": "become_host",
+            "room_id": self.room_manager.current_room.room_id,
+            "token": self.room_manager.current_room.token,
+            "files": [
+                {"id": f.file_id, "name": f.name, "size": f.size_bytes, "owner_id": f.owner_device_id, "is_dir": f.is_dir}
+                for f in self.server.file_entries
+            ],
+            "devices": [
+                {"device_id": d.device_id, "name": d.name, "ip": d.ip, "state": d.state}
+                for d in self.room_manager.current_room.devices
+            ]
+        }
+        
+        successor_obj = self.room_manager.current_room.get_device(successor.device_id)
+        if successor_obj:
+            successor_obj.pending_transfers.append(handover_info)
+            return True
+        return False
+
+    def _handle_takeover(self, cmd):
+        """Handle promotion to room host."""
+        self._set_msg("👑 PROMOTED TO HOST. Re-starting server...")
+        
+        def _bg():
+            from .room import Room, Device
+            from .server import ShareServer
+            
+            # Transition models
+            new_room = Room(
+                room_id=cmd.room_id,
+                token=cmd.token,
+                host_ip=self.room_manager._get_local_ip(),
+                port=0,
+                host_device_name=self.room_manager.device_name,
+                host_device_id=self.room_manager.device_id
+            )
+            for d in cmd.devices:
+                new_room.devices.append(Device(device_id=d["device_id"], name=d["name"], ip=d["ip"], state=d["state"]))
+            
+            self.room_manager.current_room = new_room
+            
+            # Start server
+            from .models import FileEntry
+            files = []
+            for f in cmd.files:
+                files.append(FileEntry(file_id=f["id"], name=f["name"], size_bytes=f["size"], owner_device_id=f["owner_id"], is_dir=f.get("is_dir", False)))
+            
+            self.server = ShareServer(room=new_room, port=0, bus=self.bus, file_entries=files)
+            threading.Thread(target=self.server.run_server, daemon=True).start()
+            
+            # Wait for port
+            for _ in range(20):
+                if self.server.port: break
+                time.sleep(0.1)
+            
+            if self.server.port:
+                # Notify OLD host that we are ready
+                try:
+                    import requests
+                    payload = {"ip": new_room.host_ip, "port": self.server.port, "device_id": self.room_manager.device_id}
+                    headers = {"Authorization": f"Bearer {self.client.session_id}"}
+                    # We use the OLD client's base_url which is the old host
+                    requests.post(f"{self.client.base_url}/room/handover-ready", json=payload, headers=headers, timeout=5)
+                except:
+                    pass
+                
+                # Now behave like host
+                self.client.base_url = f"http://{new_room.host_ip}:{self.server.port}"
+                self._set_msg("👑 Server started. You are now the room host.")
+                get_app().invalidate()
+        
+        threading.Thread(target=_bg, daemon=True).start()
+
     def _sync_room_state(self, data: dict):
         """Update local models from server data."""
         if not self.room_manager.current_room:
@@ -648,6 +774,20 @@ class ShareTUI:
         if "files" in data:
             self.client.room_files = data["files"]
             
+        # Phase 16: Handling Migration
+        if "migration" in data and data["migration"]:
+            m = data["migration"]
+            # If we are NOT the new host, but the current host is telling us to move
+            if self.client and m["id"] != self.room_manager.device_id:
+                new_url = f"http://{m['ip']}:{m['port']}"
+                if self.client.base_url != new_url:
+                    self._set_msg(f"Room migrating to {m['ip']}:{m['port']}...")
+                    self.client.base_url = new_url
+                    # Update room manager host/port for future reconnects
+                    if self.room_manager.current_room:
+                        self.room_manager.current_room.host_ip = m["ip"]
+                        self.room_manager.current_room.port = m["port"]
+
         try:
             get_app().invalidate()
         except: pass

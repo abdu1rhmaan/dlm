@@ -328,6 +328,15 @@ class ShareClient:
                             dl_id = self._handle_incoming_transfer(transfer)
                             if dl_id:
                                 active_share_dls.add(dl_id)
+                        elif transfer.get("action") == "become_host":
+                            # Phase 16: Transition to Host
+                            from dlm.app.commands import TakeoverRoom
+                            self.bus.handle(TakeoverRoom(
+                                room_id=transfer["room_id"],
+                                token=transfer["token"],
+                                files=transfer.get("files", []),
+                                devices=transfer.get("devices", [])
+                            ))
             except Exception:
                 pass
             
