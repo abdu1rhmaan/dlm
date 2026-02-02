@@ -358,12 +358,41 @@ class ShareServer:
             return self.get_full_state()
 
         @self.app.post("/room/request-download")
-        async def request_download(request: Request):
-            """Web Client registering intent to download."""
+        async def request_download(request: Request, session_id: str = Depends(verify_session)):
+            """Web Client registering intent to download via DLM Engine."""
+            if not session_id:
+                raise HTTPException(status_code=401, detail="Unauthorized")
+                
             data = await request.json()
             item_id = data.get("item_id")
-            self._notify(f"Web client requested download: {item_id}")
-            return {"status": "ok"}
+            device_id = data.get("device_id")
+            
+            # Find the file entry
+            fe = self._get_file_by_id(item_id)
+            if not fe:
+                 raise HTTPException(status_code=404, detail="File not found")
+            
+            # Queue for the device (if it exists)
+            device = self.room.get_device(device_id)
+            if device:
+                 file_info = {
+                     "action": "download",
+                     "file_id": fe.file_id,
+                     "name": fe.name,
+                     "size": fe.size_bytes,
+                     "sender_ip": self.room.host_ip,
+                     "sender_port": self.port,
+                     "is_dir": getattr(fe, 'is_dir', False)
+                 }
+                 # Only add if not already in queue
+                 if not any(t.get('file_id') == fe.file_id for t in device.pending_transfers):
+                    device.pending_transfers.append(file_info)
+                    self._notify(f"Engine transfer queued for {device.name}: {fe.name}")
+                    asyncio.create_task(self.broadcast_state())
+                 return {"status": "ok", "message": "Queued for DLM Engine"}
+            else:
+                self._notify(f"Web client {device_id} requested DLM transfer: {fe.name}")
+                return {"status": "ok", "message": "Request logged (No DLM instance detected)"}
             
         # 3. List Files
 
@@ -507,11 +536,13 @@ class ShareServer:
                 raise HTTPException(status_code=400, detail="device_name and device_ip required")
             
             # 1. Check if this is the host itself re-joining (e.g. from TUI)
-            if device_ip == self.room.host_ip and (device_id == "HOST" or device_name == self.room.host_device_name):
+            if device_ip == self.room.host_ip and (device_id == self.room.host_device_id or device_id == "HOST" or "(you)" in device_name.lower()):
                  # Update host state instead of adding new device
                  for d in self.room.devices:
                       if "(you)" in d.name or d.device_id == self.room.host_device_id:
                            d.update_heartbeat()
+                           # Ensure name still has (you)
+                           if "(you)" not in d.name: d.name += " (you)"
                            return {
                                "room_id": self.room.room_id,
                                "device_id": d.device_id,
@@ -736,6 +767,19 @@ class ShareServer:
         if not self.room or not self.port or self.port == 0:
              self.prepare()
         
+        # Phase 20: Silence logging to avoid TUI corruption
+        import logging
+        uvicorn_logger = logging.getLogger("uvicorn")
+        uvicorn_logger.setLevel(logging.ERROR)
+        
+        # Silence root logger as well
+        logging.getLogger().setLevel(logging.ERROR)
+        
+        # Redirect all INFO to a log file instead
+        fh = logging.FileHandler("dlm_share_server.log")
+        fh.setLevel(logging.INFO)
+        logging.getLogger().addHandler(fh)
+
         # Run Uvicorn
         config = uvicorn.Config(self.app, host=self.host, port=self.port, log_level="error", ws_ping_interval=None)
         self._server = uvicorn.Server(config)
@@ -802,6 +846,10 @@ class ShareServer:
             if candidates:
                 # Return the one with highest score
                 candidates.sort(reverse=True)
+                # Phase 20: Ensure it's not a common internal bridge if possible
+                for _, ip in candidates:
+                    if not ip.startswith('172.17.') and not ip.startswith('172.18.'):
+                        return ip
                 return candidates[0][1]
             
             # Absolute fallback: Find ANY IPv4
@@ -926,7 +974,8 @@ dlm share join --ip {host} --port {port} --token {token}
         if token_hint:
              auto_auth_js = f"localStorage.setItem('dlm_token', '{token_hint}');"
 
-        return f"""
+        # Phase 19: Use a multi-line string instead of f-string to avoid brace escaping hell
+        template = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -936,7 +985,7 @@ dlm share join --ip {host} --port {port} --token {token}
     <style>
         @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
         
-        :root {{
+        :root {
             --bg: #0a0a0a;
             --fg: #f0f0f0;
             --accent: #00ff41; /* Matrix/Terminal Green */
@@ -945,11 +994,11 @@ dlm share join --ip {host} --port {port} --token {token}
             --header-bg: #1a1a1a;
             --box-bg: #0d0d0d;
             --font: 'JetBrains Mono', 'Courier New', monospace;
-        }}
+        }
         
-        * {{ box-sizing: border-box; outline: none; }}
+        * { box-sizing: border-box; outline: none; }
         
-        body {{
+        body {
             background-color: var(--bg);
             color: var(--fg);
             font-family: var(--font);
@@ -959,26 +1008,32 @@ dlm share join --ip {host} --port {port} --token {token}
             line-height: 1.5;
             display: flex;
             justify-content: center;
-        }}
+            animation: flicker 0.15s infinite;
+        }
         
-        .dashboard {{
+        .dashboard {
             width: 100%;
             max-width: 1200px;
             display: grid;
             grid-template-columns: 320px 1fr;
             grid-template-rows: auto 1fr;
             gap: 20px;
-        }}
+            position: relative;
+            z-index: 10;
+        }
         
-        @media (max-width: 900px) {{
-            .dashboard {{ grid-template-columns: 1fr; }}
-            body {{ padding: 10px; }}
-        }}
+        @media (max-width: 900px) {
+            .dashboard { grid-template-columns: 1fr; }
+            body { padding: 10px; }
+        }
+
+        /* Phase 19: Matrix Glow */
+        * { text-shadow: 0 0 5px rgba(0, 255, 65, 0.2); }
 
         /* Typography & Elements */
-        h1, h2, h3 {{ margin: 0; text-transform: uppercase; letter-spacing: 1px; }}
-        .dim {{ color: var(--dim); }}
-        .header-block {{ 
+        h1, h2, h3 { margin: 0; text-transform: uppercase; letter-spacing: 1px; }
+        .dim { color: var(--dim); }
+        .header-block { 
             grid-column: 1 / -1; 
             padding: 15px; 
             background: var(--header-bg); 
@@ -986,17 +1041,17 @@ dlm share join --ip {host} --port {port} --token {token}
             display: flex;
             justify-content: space-between;
             align-items: center;
-        }}
+        }
         
         /* Terminal Boxes */
-        .box {{
+        .box {
             background: var(--box-bg);
             border: 1px solid var(--border);
             position: relative;
             padding: 25px 15px 15px 15px;
             box-shadow: 0 4px 15px rgba(0,0,0,0.5);
-        }}
-        .box::before {{
+        }
+        .box::before {
             content: attr(data-title);
             position: absolute;
             top: 0; left: 0; right: 0;
@@ -1007,38 +1062,38 @@ dlm share join --ip {host} --port {port} --token {token}
             font-size: 10px;
             padding: 2px 10px;
             text-transform: uppercase;
-        }}
+        }
 
         /* Info Grid */
-        .info-row {{ display: flex; justify-content: space-between; margin-bottom: 8px; border-bottom: 1px dashed #222; padding-bottom: 4px; }}
-        .info-label {{ font-weight: bold; color: var(--accent); }}
+        .info-row { display: flex; justify-content: space-between; margin-bottom: 8px; border-bottom: 1px dashed #222; padding-bottom: 4px; }
+        .info-label { font-weight: bold; color: var(--accent); }
 
         /* Live Monitor */
-        .monitor {{ border-color: var(--accent); }}
-        .progress-container {{
+        .monitor { border-color: var(--accent); }
+        .progress-container {
             margin-top: 15px;
             border: 1px solid var(--dim);
             height: 24px;
             position: relative;
             background: #001100;
             overflow: hidden;
-        }}
-        .progress-bar {{
+        }
+        .progress-bar {
             height: 100%;
             background: linear-gradient(90deg, var(--dim), var(--accent));
             width: 0%;
             transition: width 0.3s ease;
-        }}
-        .progress-text {{
+        }
+        .progress-text {
             position: absolute;
             top: 0; left: 0; width: 100%; height: 100%;
             display: flex; align-items: center; justify-content: center;
             font-weight: bold; color: #fff;
             mix-blend-mode: difference;
-        }}
+        }
 
         /* Buttons and Inputs */
-        .btn {{
+        .btn {
             background: var(--accent);
             color: #000;
             border: none;
@@ -1050,31 +1105,31 @@ dlm share join --ip {host} --port {port} --token {token}
             width: 100%;
             margin-top: 10px;
             transition: 0.1s;
-        }}
-        .btn:hover {{ background: #fff; }}
-        .btn-secondary {{ 
+        }
+        .btn:hover { background: #fff; }
+        .btn-secondary { 
             background: transparent; 
             border: 1px solid var(--accent); 
             color: var(--accent); 
-        }}
-        .btn-secondary:hover {{ background: var(--accent); color: #000; }}
+        }
+        .btn-secondary:hover { background: var(--accent); color: #000; }
 
         /* Lists & Tables */
-        .list-container {{ max-height: 350px; overflow-y: auto; }}
-        table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
-        th {{ text-align: left; color: var(--dim); font-size: 11px; padding: 5px; border-bottom: 1px solid var(--border); }}
-        td {{ padding: 10px 5px; border-bottom: 1px solid #1a1a1a; }}
+        .list-container { max-height: 350px; overflow-y: auto; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th { text-align: left; color: var(--dim); font-size: 11px; padding: 5px; border-bottom: 1px solid var(--border); }
+        td { padding: 10px 5px; border-bottom: 1px solid #1a1a1a; }
         
-        .status-badge {{
+        .status-badge {
             font-size: 10px;
             padding: 2px 6px;
             border-radius: 2px;
             background: #222;
-        }}
-        .status-active {{ color: var(--accent); border: 1px solid var(--accent); }}
+        }
+        .status-active { color: var(--accent); border: 1px solid var(--accent); }
 
         /* Terminal Logs at Bottom */
-        .terminal {{
+        .terminal {
             grid-column: 1 / -1;
             height: 120px;
             background: #000;
@@ -1083,10 +1138,10 @@ dlm share join --ip {host} --port {port} --token {token}
             overflow-y: auto;
             color: #ccc;
             font-size: 11px;
-        }}
+        }
         
         /* QR Code Container */
-        .qr-box {{
+        .qr-box {
             display: flex;
             flex-direction: column;
             align-items: center;
@@ -1095,20 +1150,39 @@ dlm share join --ip {host} --port {port} --token {token}
             padding: 10px;
             margin-top: 15px;
             border-radius: 4px;
-        }}
-        #qr-code {{ width: 150px; height: 150px; }}
+        }
+        #qr-code { width: 150px; height: 150px; }
 
-        #toast {{
+        #toast {
             position: fixed; top: 20px; right: 20px;
             background: var(--accent); color: #000;
             padding: 12px 24px; font-weight: bold;
             display: none; box-shadow: 0 5px 20px rgba(0,255,65,0.3);
             z-index: 10000;
-        }}
+        }
+
+        /* Phase 19: CRT Effects */
+        .scanlines {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: linear-gradient(rgba(18,16,16,0) 50%, rgba(0,0,0,0.1) 50%), 
+                        linear-gradient(90deg, rgba(255,0,0,0.03), rgba(0,255,0,0.01), rgba(0,0,255,0.03));
+            background-size: 100% 3px, 3px 100%;
+            pointer-events: none; z-index: 9999;
+        }
+        @keyframes flicker {
+            0% { opacity: 0.97; }
+            5% { opacity: 0.95; }
+            10% { opacity: 0.97; }
+            15% { opacity: 0.94; }
+            20% { opacity: 0.98; }
+            100% { opacity: 1; }
+        }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/qrcode@1.4.4/build/qrcode.min.js"></script>
 </head>
 <body onload="init()">
+
+<div class="scanlines"></div>
 
 <div id="toast">SYSTEM: COPIED TO CLIPBOARD</div>
 
@@ -1135,40 +1209,15 @@ dlm share join --ip {host} --port {port} --token {token}
             <button class="btn btn-secondary" onclick="window.location.reload()">REFRESH SYSTEM</button>
         </div>
 
-        <div class="box" data-title="Access QR" style="margin-top: 20px;">
-            <div class="qr-box">
-                <canvas id="qr-canvas"></canvas>
-            </div>
-            <div style="text-align: center; font-size: 10px; margin-top: 8px;" class="dim">SCAN FOR AUTO-AUTH</div>
-        </div>
-    </div>
-
-    <!-- Main Content -->
-    <div class="main-panel">
-        <div class="box monitor" data-title="Live Transfer Monitor">
-            <div id="transfer-inactive" style="text-align: center; padding: 20px; color: #444;">NO ACTIVE TRANSFERS IN PIPELINE</div>
-            <div id="transfer-active" style="display: none;">
-                <div class="info-row">
-                    <span id="pipeline-file" style="font-weight: bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 70%;">--</span>
-                    <span id="pipeline-speed" style="color: var(--accent);">0.0 MB/s</span>
-                </div>
-                <div class="progress-container">
-                    <div id="pipeline-bar" class="progress-bar"></div>
-                    <div id="pipeline-text" class="progress-text">0%</div>
-                </div>
-                <div style="font-size: 10px; margin-top: 4px; text-align: right;" class="dim" id="pipeline-stats">0 B / 0 B</div>
-            </div>
-        </div>
-
-        <div class="box" data-title="Connected Peers" style="margin-top: 20px;">
+        <div class="box" data-title="Active Peers" style="margin-top: 20px;">
             <div class="list-container">
-                <table id="device-table">
+                <table>
                     <thead>
                         <tr>
-                            <th>NODE NAME</th>
-                            <th>ENDPOINT</th>
+                            <th>DEVICE</th>
+                            <th>ADDRESS</th>
                             <th>STATUS</th>
-                             <th>ACTIVITY</th>
+                            <th>STATE</th>
                         </tr>
                     </thead>
                     <tbody id="device-list">
@@ -1176,6 +1225,31 @@ dlm share join --ip {host} --port {port} --token {token}
                     </tbody>
                 </table>
             </div>
+        </div>
+
+        <div class="box monitor" data-title="Transfer Monitor" style="margin-top: 20px;" id="transfer-active">
+            <div class="info-row"><span class="info-label">FILE:</span> <span id="pipeline-file">---</span></div>
+            <div class="info-row"><span class="info-label">SPEED:</span> <span id="pipeline-speed">0.00 MB/s</span></div>
+            <div class="progress-container">
+                <div class="progress-bar" id="pipeline-bar"></div>
+                <div class="progress-text" id="pipeline-text">0%</div>
+            </div>
+            <div style="font-size: 10px; margin-top: 8px;" class="dim" id="pipeline-stats"></div>
+        </div>
+    </div>
+
+    <!-- Main Content -->
+    <div class="main-content">
+        <div class="box" data-title="Room Identity">
+             <div style="display:flex; justify-content:space-between; align-items:center;">
+                <div>
+                    <h3>CONNECT TO NODE</h3>
+                    <p class="dim">Scan this QR or copy the automated bash join script.</p>
+                </div>
+                <div class="qr-box">
+                    <canvas id="qr-canvas"></canvas>
+                </div>
+             </div>
         </div>
 
         <div class="box" data-title="Shared Directory" style="margin-top: 20px;">
@@ -1198,7 +1272,7 @@ dlm share join --ip {host} --port {port} --token {token}
 
     <div class="terminal" id="terminal">
         [SYS] DLM Share Engine v2.0 Initialized.<br>
-        [SYS] Awaiting WebSocket handshake...<br>
+        [SYS] Awaiting WebSocket handshake.<br>
     </div>
 </div>
 
@@ -1207,75 +1281,85 @@ dlm share join --ip {host} --port {port} --token {token}
     let startTime = Date.now();
     {auto_auth_js}
 
-    function log(msg, type='SYS') {{
+    function log(msg, type='SYS') {
         const term = document.getElementById('terminal');
         const time = new Date().toLocaleTimeString();
         const color = type === 'ERR' ? '#ff3e3e' : (type === 'OK' ? '#00ff41' : '#ccc');
-        term.innerHTML += `[<span style="color:${{color}}">${{type}}</span>] [${{time}}] ${{msg}}<br>`;
+        term.innerHTML += `[<span style="color:${color}">${type}</span>] [${time}] ${msg}<br>`;
         term.scrollTop = term.scrollHeight;
-    }}
+    }
 
-    function init() {{
-        setInterval(() => {{
+    function init() {
+        setInterval(() => {
             document.getElementById('clock').innerText = new Date().toLocaleTimeString();
             document.getElementById('uptime').innerText = Math.floor((Date.now() - startTime)/1000) + 's';
-        }}, 1000);
+        }, 1000);
         
         generateQR();
         connectWS();
         hydrate();
-    }}
 
-    function generateQR() {{
+        window.onbeforeunload = () => {
+            const token = localStorage.getItem('dlm_token');
+            const devId = localStorage.getItem('dlm_device_id');
+            if (token && devId) {
+                navigator.sendBeacon('/room/leave', JSON.stringify({
+                    device_id: devId
+                }));
+            }
+        };
+    }
+
+    function generateQR() {
         const canvas = document.getElementById('qr-canvas');
         const url = window.location.href;
-        QRCode.toCanvas(canvas, url, {{
+        QRCode.toCanvas(canvas, url, {
             margin: 1,
             width: 150,
-            color: {{
+            color: {
                 dark: '#000000',
                 light: '#ffffff'
-            }}
-        }}, (err) => {{
+            }
+        }, (err) => {
             if (err) console.error(err);
-        }});
-    }}
+        });
+    }
 
-    function connectWS() {{
+    function connectWS() {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        ws = new WebSocket(`${{protocol}}//${{window.location.host}}/ws`);
+        ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
         
-        ws.onopen = () => {{
+        ws.onopen = () => {
             document.getElementById('connection-status').style.color = 'var(--accent)';
             document.getElementById('connection-status').innerText = 'STATUS: ONLINE // ENCRYPTED';
             log("WebSocket link established.", "OK");
-        }};
+        };
 
-        ws.onmessage = (e) => {{
+        ws.onmessage = (e) => {
             const data = JSON.parse(e.data);
-            if (data.type === 'state') {{
+            if (data.type === 'state') {
                 renderState(data);
-            }} else if (data.type === 'progress') {{
+            } else if (data.type === 'progress') {
                 updateProgress(data);
-            }}
-        }};
+            }
+        };
 
-        ws.onclose = () => {{
+        ws.onclose = () => {
             document.getElementById('connection-status').style.color = '#ff3e3e';
             document.getElementById('connection-status').innerText = 'STATUS: OFFLINE // RETRYING';
             log("Signal lost. Re-establishing...", "ERR");
             setTimeout(connectWS, 2000);
-        }};
-    }}
+        };
+    }
 
-    async function hydrate() {{
-        try {{
+    async function hydrate() {
+        try {
             const token = localStorage.getItem('dlm_token');
             let devId = localStorage.getItem('dlm_device_id');
-            if (!devId) {{
+            if (!devId) {
                 devId = 'WEB-' + Math.random().toString(36).substr(2, 6).toUpperCase();
                 localStorage.setItem('dlm_device_id', devId);
-            }}
+            }
             
             const url = new URL('/api/room/state', window.location.origin);
             if (token) url.searchParams.set('token', token);
@@ -1284,19 +1368,19 @@ dlm share join --ip {host} --port {port} --token {token}
             url.searchParams.set('device_name', 'Web Client');
 
             const res = await fetch(url);
-            if (res.ok) {{
+            if (res.ok) {
                 const data = await res.json();
                 renderState(data);
                 log("Session authorized. ID: " + devId, "OK");
-            }} else {{
+            } else {
                 log("Authorization failed (" + res.status + "). Check token.", "ERR");
-            }}
-        }} catch(e) {{
+            }
+        } catch(e) {
             log("Network failure during handshake.", "ERR");
-        }}
-    }}
+        }
+    }
 
-    function renderState(state) {{
+    function renderState(state) {
         // UI Sync
         document.getElementById('room-id').innerText = state.room_id || "{room_id}";
         document.getElementById('room-token').innerText = state.token || "{token}";
@@ -1304,56 +1388,96 @@ dlm share join --ip {host} --port {port} --token {token}
         // Devices
         const devList = document.getElementById('device-list');
         devList.innerHTML = '';
-        if (state.devices.length === 0) {{
+        if (state.devices.length === 0) {
              devList.innerHTML = '<tr><td colspan="4" style="text-align:center" class="dim">No active peers found</td></tr>';
-        }} else {{
-            state.devices.forEach(d => {{
+        } else {
+            state.devices.forEach(d => {
                 const row = document.createElement('tr');
-                const badge = d.is_active ? '<span class="status-badge status-active">ACTIVE</span>' : '<span class="status-badge">IDLE</span>';
+                const isYou = d.device_id === localStorage.getItem('dlm_device_id');
+                const badgeClass = d.is_active ? 'status-active' : '';
+                const nameTag = isYou ? d.name + ' (YOU)' : d.name;
                 row.innerHTML = `
-                    <td>${{d.name}}</td>
-                    <td>${{d.ip}}</td>
-                    <td>${{badge}}</td>
-                    <td class="dim" style="font-size:10px">${{d.state.toUpperCase()}}</td>
+                    <td style="${isYou ? 'color:var(--accent)' : ''}">${nameTag}</td>
+                    <td>${d.ip}</td>
+                    <td><span class="status-badge ${badgeClass}">${d.is_active ? 'ACTIVE' : 'IDLE'}</span></td>
+                    <td class="dim" style="font-size:10px">${d.state.toUpperCase()}</td>
                 `;
                 devList.appendChild(row);
-            }});
-        }}
+            });
+        }
 
         // Files
         const fileList = document.getElementById('file-list');
         fileList.innerHTML = '';
-        if (!state.files || state.files.length === 0) {{
+        if (!state.files || state.files.length === 0) {
              fileList.innerHTML = '<tr><td colspan="3" style="text-align:center" class="dim">Shared directory is empty</td></tr>';
-        }} else {{
-            state.files.forEach(f => {{
+        } else {
+            state.files.forEach(f => {
                 const row = document.createElement('tr');
+                const token = localStorage.getItem('dlm_token') || "";
                 row.innerHTML = `
-                    <td style="font-weight:bold">${{f.name}}</td>
-                    <td class="dim">${{formatSize(f.size)}}</td>
-                    <td><button class="btn btn-secondary" style="margin:0; padding:4px 10px;" onclick="downloadFile('${{f.id}}')">GET</button></td>
+                    <td style="font-weight:bold">${f.name}</td>
+                    <td class="dim">${formatSize(f.size)}</td>
+                    <td style="text-align:right">
+                        <button class="btn btn-secondary" style="margin:0; padding:4px 8px; font-size:10px;" onclick="requestDlmTransfer('${f.id}')">DLM</button>
+                        <button class="btn" style="margin:0; padding:4px 8px; font-size:10px;" onclick="downloadViaBrowser('${f.id}', '${f.name}')">GET</button>
+                    </td>
                 `;
                 fileList.appendChild(row);
-            }});
-        }}
+            });
+        }
 
-        // Pipeline Logic (Aggregate)
-        if (state.transfer && state.transfer.active) {{
+        // Pipeline Logic
+        if (state.transfer && state.transfer.active) {
             showTransferUI(true);
             document.getElementById('pipeline-speed').innerText = state.transfer.speed.toFixed(2) + " MB/s";
             document.getElementById('pipeline-bar').style.width = state.transfer.progress.toFixed(1) + '%';
             document.getElementById('pipeline-text').innerText = state.transfer.progress.toFixed(1) + '%';
-        }} else {{
-             // Don't hide immediately to allow "100%" to be seen
-        }}
-    }}
+        }
+    }
 
-    function showTransferUI(active) {{
+    function downloadViaBrowser(id, name) {
+        const token = localStorage.getItem('dlm_token');
+        const url = `/download/${id}${token ? '?token=' + token : ''}`;
+        log("Browser download initiated: " + name, "OK");
+        window.location.href = url;
+    }
+
+    async function requestDlmTransfer(id) {
+        try {
+            const token = localStorage.getItem('dlm_token');
+            const devId = localStorage.getItem('dlm_device_id');
+            const res = await fetch('/room/request-download', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': 'Bearer ' + token
+                },
+                body: JSON.stringify({ 
+                    item_id: id,
+                    device_id: devId
+                })
+            });
+            const data = await res.json();
+            log(data.message || "Request sent to DLM Engine", "OK");
+        } catch(e) {
+            log("Engine request failed.", "ERR");
+        }
+    }
+
+    function formatSize(bytes) {
+        if (!bytes) return '0 B';
+        const k = 1024;
+        const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    }
+
+    function showTransferUI(active) {
         document.getElementById('transfer-active').style.display = active ? 'block' : 'none';
-        document.getElementById('transfer-inactive').style.display = active ? 'none' : 'block';
-    }}
+    }
 
-    function updateProgress(data) {{
+    function updateProgress(data) {
         showTransferUI(true);
         document.getElementById('pipeline-file').innerText = data.file;
         document.getElementById('pipeline-speed').innerText = data.speed;
@@ -1361,46 +1485,27 @@ dlm share join --ip {host} --port {port} --token {token}
         document.getElementById('pipeline-text').innerText = data.percent.toFixed(1) + '%';
         document.getElementById('pipeline-stats').innerText = data.progress_text || "";
         
-        if (data.percent >= 100) {{
+        if (data.percent >= 100) {
              log("Packet transfer complete: " + data.file, "OK");
              setTimeout(() => showTransferUI(false), 5000);
-        }}
-    }}
+        }
+    }
 
-    function formatSize(bytes) {{
-        if (!bytes) return '0 B';
-        const k = 1024;
-        const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-        const i = Math.floor(Math.log(bytes) / Math.log(k));
-        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-    }}
-
-    function downloadFile(id) {{
-        fetch('/room/request-download', {{
-            method: 'POST',
-            headers: {{'Content-Type': 'application/json'}},
-            body: JSON.stringify({{ item_id: id }})
-        }}).then(() => {{
-            const token = localStorage.getItem('dlm_token');
-            window.location.href = `/download/${{id}}${{token ? '?token=' + token : ''}}`;
-            log("Requesting file entry: " + id);
-        }});
-    }}
-
-    function copyJoinScript() {{
-        const raw = `{bash_payload}`;
+    function copyJoinScript() {
+        const raw = "{bash_payload}";
         const script = raw.replace(/\\\\n/g, '\\n').replace(/\\\\`/g, '`').replace(/\\\\\\$/g, '$');
-        navigator.clipboard.writeText(script).then(() => {{
+        navigator.clipboard.writeText(script).then(() => {
             const toast = document.getElementById('toast');
             toast.style.display = 'block';
             setTimeout(() => toast.style.display = 'none', 3000);
-        }});
-    }}
+        });
+    }
 </script>
-
 </body>
 </html>
-"""
+""".replace("{room_id}", room_id).replace("{token}", token).replace("{host}", host).replace("{port}", str(port)).replace("{bash_payload}", bash_payload).replace("{auto_auth_js}", auto_auth_js)
+
+        return template
 
     def _format_size(self, size):
         for unit in ['B', 'KB', 'MB', 'GB']:

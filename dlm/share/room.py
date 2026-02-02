@@ -18,13 +18,13 @@ class Device:
     pending_transfers: List[dict] = field(default_factory=list) # Phase 2 Coordination
     current_transfer: Optional[dict] = None # {file_id, name, progress, speed, size}
     
-    def is_active(self, timeout_seconds: int = 60) -> bool:
+    def is_active(self, timeout_seconds: int = 30) -> bool:
         """Check if device is still active (seen recently)."""
+        # Treat (you) or the host as always active if it's the current session
+        if "(you)" in self.name or self.device_id == "HOST":
+            return True
         if not self.last_seen:
             return False
-        # Treat (you) as always active
-        if "(you)" in self.name:
-            return True
         return datetime.now() - self.last_seen < timedelta(seconds=timeout_seconds)
     
     def update_heartbeat(self):
@@ -44,7 +44,7 @@ class Room:
     owner_device_id: str = "HOST" # Phase 16: Tracks authority for handover
     devices: List[Device] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)
-    ttl: int = 3600  # 1 hour default
+    ttl: int = 86400  # 24 hours default
     
     @staticmethod
     def generate_room_id() -> str:
@@ -93,6 +93,8 @@ class Room:
             device.state = state
             device.update_heartbeat()
 
-    def prune_stale_devices(self, timeout_seconds: int = 90):
-        """Remove devices not seen for a while."""
+    def prune_stale_devices(self, timeout_seconds: int = 60) -> bool:
+        """Remove devices not seen for a while. Returns True if any removed."""
+        old_count = len(self.devices)
         self.devices = [d for d in self.devices if d.is_active(timeout_seconds)]
+        return len(self.devices) != old_count

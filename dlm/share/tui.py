@@ -295,11 +295,9 @@ class ShareTUI:
     def _get_lobby_actions(self):
         return [
             ("add", "Add Files / Folders"),
-            ("copy", "Copy Invite Link"),
-            ("view", "Download from Others"),
+            ("view", "View Shared Files"),
             ("queue", "Open Queue / Send Files"),
             ("qr", "Show Room QR"),
-            ("refresh", "Refresh Status"),
             ("leave", "Leave Room")
         ]
 
@@ -466,6 +464,12 @@ class ShareTUI:
         """Start transferring all pending items in queue."""
         if not self.client or not self.queue:
             return
+
+        room = self.room_manager.current_room
+        other_devices = [d for d in room.devices if "(you)" not in d.name and d.is_active()] if room else []
+        if not other_devices:
+             self._set_error("No active peers to send to!")
+             return
             
         # 1. Prepare server with all queued files
         if self.server:
@@ -495,7 +499,7 @@ class ShareTUI:
             self.last_msg = f"Transfer started for {len(files_data)} items."
             self.screen = "lobby"; self.list_index = 0
         else:
-            self.last_error = "No targets or files to send."
+            self.last_error = "No pending files found."
 
     def _handle_back(self, event):
         if self.screen == "main":
@@ -529,6 +533,8 @@ class ShareTUI:
             import pyperclip
             pyperclip.copy(url)
             self._set_msg("Invite link COPIED to clipboard.")
+        except KeyboardInterrupt:
+            return
         except ImportError:
             # Fallback: Just show it very clearly
             self._set_msg(f"LINK: {url}")
@@ -878,7 +884,7 @@ class ShareTUI:
         file_count = self._get_files_count()
         queue_count = len([f for f in self.queue.queue if f.status == "pending"])
         
-        # --- HEADER / STATUS (Display Only) ---
+        # --- HEADER / STATUS ---
         lines = [
             f" <header>DLM SHARE ROOM</header>  ID: <room-id>{room.room_id}</room-id>  |  TOKEN: <msg>{room.token}</msg>",
             f" <header>Invite:</header> <msg>http://{room.host_ip}:{room.port}/invite?t={room.token}</msg>",
@@ -886,6 +892,18 @@ class ShareTUI:
             " " + "─"*60
         ]
         
+        # --- TOTAL PROGRESS (Unified) ---
+        active_transfers = [d.current_transfer for d in room.devices if d.current_transfer]
+        if active_transfers:
+            total_prog = sum(t.get('progress', 0) for t in active_transfers) / len(active_transfers)
+            total_speed = sum(t.get('speed', 0.0) for t in active_transfers)
+            
+            width = 40
+            filled = int(total_prog / 100 * width)
+            bar = "█" * filled + "░" * (width - filled)
+            lines.append(f" <header>TOTAL PROGRESS:</header> <msg>[{bar}] {total_prog:.1f}% ({total_speed:.2f} MB/s)</msg>")
+            lines.append(" " + "─"*60)
+
         # Display Devices
         devices = room.devices
         lines.append(" <header>Connected Devices:</header>")
@@ -893,7 +911,6 @@ class ShareTUI:
             lines.append("  <i>No devices connected</i>")
         else:
             for d in devices:
-                # Devices are NOT selectable, so just show them
                 is_you = "(you)" in d.name
                 style = "device-you" if is_you else ("device-active" if d.is_active() else "device-idle")
                 active_mark = "●" if d.is_active() else "○"
@@ -912,16 +929,6 @@ class ShareTUI:
                     bar = "█" * filled + "░" * (width - filled)
                     lines.append(f"      <msg>└ {name[:25]:<25} [{bar}] {prog:.1f}% ({speed:.1f} MB/s)</msg>")
 
-        # --- GLOBAL TRANSFER SUMMARY ---
-        if self.show_global_progress:
-            active_transfers = [d.current_transfer for d in devices if d.current_transfer]
-            if active_transfers:
-                lines.append("\n <header>GLOBAL TRANSFERS</header>")
-                for t in active_transfers:
-                    prog = t.get('progress', 0)
-                    bar_str = "█"*int(prog/5) + "░"*(20-int(prog/5))
-                    lines.append(f" {t['name'][:20]:<20} <msg>[{bar_str}] {prog:>5.1f}%</msg>")
-
         lines.append(" " + "─"*50)
         
         # --- ACTION MENU (Selectable) ---
@@ -929,10 +936,9 @@ class ShareTUI:
         
         actions = self._get_lobby_actions()
         for i, (act, label) in enumerate(actions):
-            # i matches simple list index
             is_selected = (i == self.list_index)
             prefix = " > " if is_selected else "   "
-            style = "selected" if is_selected else "header" if act in ("refresh", "leave") else "default"
+            style = "selected" if is_selected else "default"
             lines.append(f" <{style}>{prefix}{label}</{style}>")
             
         if self.last_msg:
@@ -1007,6 +1013,20 @@ def run_share_tui(bus):
         
         tui = ShareTUI(run_share_tui._room_manager, bus)
         tui.run()
+    except KeyboardInterrupt:
+        # Phase 21: Explicit leave for participants on Ctrl+C
+        rm = getattr(run_share_tui, '_room_manager', None)
+        if rm and rm.current_room and rm.role == 'RECV':
+             try:
+                 from .client import ShareClient
+                 client = ShareClient(bus)
+                 client.leave_room(
+                     rm.current_room['host_ip'], 
+                     rm.current_room['port'], 
+                     rm.current_room['token']
+                 )
+             except: pass
+        return
     except Exception as e:
         import traceback
         print(f"\n❌ \033[1;31mSHARE TUI CRASHED\033[0m")

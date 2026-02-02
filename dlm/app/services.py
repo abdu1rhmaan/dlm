@@ -331,6 +331,18 @@ class DownloadService:
                 if not download_id:
                     break
                 
+                # [FIX] Priority bypass for share tasks to ensure instant LAN transfer
+                # Re-fetch dl to check source, as download_id might have come from DB
+                dl = self.repository.get(download_id) if download_id else None
+                active_count = self._get_active_count()
+                
+                if dl and dl.source == 'share':
+                    # Skip concurrency limits and start immediately
+                    pass
+                elif dl and dl.source != 'share' and active_count >= self.concurrency_limit:
+                    # If it's not a share task and we're at capacity, don't start it
+                    continue
+                
                 if download_id in self._active_downloads:
                     continue
                 
@@ -753,9 +765,14 @@ class DownloadService:
 
             # Step 2: Standard HTTP
         try:
-            if total_size > 0:
+            # Phase 20: Optimization for LAN/Share URLs
+            is_lan = any(prefix in url for prefix in ["192.168.", "10.", "172."])
+            if source == 'share' or is_lan:
+                dl.total_size = total_size
+                dl.resumable = True # LAN transfers are assumed resumable (dlm-to-dlm)
+            elif total_size > 0:
                  dl.total_size = total_size
-                 dl.resumable = True # Assume resumable if we have explicit size (implied safe source)
+                 dl.resumable = True
             else:
                  try:
                      dl.total_size = self.network.get_content_length(url, referer=dl.referer)
@@ -785,6 +802,11 @@ class DownloadService:
 
             if not dl.resumable:
                 dl.resumable = self.network.supports_ranges(url, referer=dl.referer)
+            
+            # Phase 20: Ensure share tasks always initialize segments
+            if dl.source == 'share' and dl.total_size > 0:
+                dl.resumable = True
+                
             self._initialize_segments(dl)
             dl.state = DownloadState.QUEUED
             if ephemeral:

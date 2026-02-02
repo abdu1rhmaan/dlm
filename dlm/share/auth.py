@@ -41,7 +41,7 @@ class AuthManager:
         session_id = str(uuid.uuid4())
         # Session expires in 1 hour or when room ends
         from datetime import timedelta
-        expires_at = datetime.now() + timedelta(hours=1)
+        expires_at = datetime.now() + timedelta(minutes=15)
         
         session = Session(
             session_id=session_id,

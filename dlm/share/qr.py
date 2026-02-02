@@ -53,9 +53,8 @@ def generate_room_qr(room_id: str, ip: str, port: int, token: str) -> str:
         # Add bottom border
         output.append("└" + "─" * width + "┘")
         
-        # Unified link display
-        footer = f"\n Join: http://{ip}:{port}/invite?t={token}"
-        return '\n'.join(output) + footer
+        # No footer link - already shown in TUI header
+        return '\n'.join(output)
     
     except ImportError:
         return """

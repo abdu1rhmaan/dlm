@@ -423,8 +423,30 @@ class ShareClient:
         except Exception:
             return None
     
+    def leave_room(self, ip: str = None, port: int = None, token: str = None):
+        """Explicitly notify host that we are leaving."""
+        # Use session defaults if not provided
+        if not ip and self.base_url:
+             url = f"{self.base_url}/room/leave"
+        elif ip and port:
+             url = f"http://{ip}:{port}/room/leave"
+        else:
+             return
+             
+        try:
+            device_id = self.device_id or "UNKNOWN"
+            headers = {"Authorization": f"Bearer {self.session_id}"} if self.session_id else {}
+            requests.post(url, json={"device_id": device_id}, headers=headers, timeout=2)
+            self._notify("Left room.")
+        except:
+            pass
+
     def stop_heartbeat(self):
-        """Stop heartbeat thread."""
+        """Stop heartbeat thread and notify host of departure."""
+        # Phase 21: Explicit leave notification for Terminal users
+        if self.session_id and self.base_url:
+             self.leave_room()
+             
         self._stop_heartbeat.set()
         if self._heartbeat_thread:
             self._heartbeat_thread.join(timeout=2)
@@ -446,13 +468,15 @@ class ShareClient:
                         
                         score = 70
                         if ip.startswith('192.168.1.') or ip.startswith('192.168.0.'): score = 100
-                        elif ip.startswith('192.168.56.'): score = 10  # Deprioritize VBox
                         elif ip.startswith('192.168.'): score = 95
                         elif ip.startswith('10.'): score = 90
                         elif ip.startswith('172.'):
                             try:
                                 second = int(ip.split('.')[1])
-                                if 16 <= second <= 31: score = 80
+                                if 16 <= second <= 31: 
+                                    # Filter common bridge ranges like 172.17 (docker)
+                                    if second == 17 or second == 18: score = 50
+                                    else: score = 80
                             except: pass
                         candidates.append((score, ip))
             
