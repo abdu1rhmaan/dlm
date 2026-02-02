@@ -5,6 +5,8 @@ from dlm.app.commands import AddDownload, ShareNotify
 from pathlib import Path
 import threading
 from typing import Optional, List
+import uuid
+import os
 
 
 class ShareClient:
@@ -17,8 +19,11 @@ class ShareClient:
         self.device_id = None
         self.room_id = None
         self._heartbeat_thread: Optional[threading.Thread] = None
+        self._transfer_thread: Optional[threading.Thread] = None
         self._stop_heartbeat = threading.Event()
         self.room_files = []
+        self.send_queue = [] # Local list of {targets, files, status}
+        self.current_push = None
 
     def _notify(self, msg: str, is_error: bool = False):
         """Send notification via bus."""
@@ -194,8 +199,9 @@ class ShareClient:
                 self.room_id = data["room_id"]
                 self.device_id = data["device_id"]
                 
-                # Start heartbeat
+                # Start threads
                 self._start_heartbeat()
+                self._start_transfer_loop()
                 
                 return True
             
@@ -204,6 +210,70 @@ class ShareClient:
         except Exception as e:
             print(f"Failed to join room: {e}")
             return False
+    
+    def _start_transfer_loop(self):
+        """Start the autonomous transfer manager."""
+        self._transfer_thread = threading.Thread(target=self._transfer_loop, daemon=True)
+        self._transfer_thread.start()
+
+    def _transfer_loop(self):
+        """Autonomous transfer manager: FIFO, Lock-aware, Push-only."""
+        while not self._stop_heartbeat.is_set():
+            # 1. Find pending items in local queue
+            pending_batch = None
+            for item in self.send_queue:
+                if item["status"] == "pending":
+                    pending_batch = item
+                    break
+            
+            if not pending_batch:
+                time.sleep(1)
+                continue
+            
+            # 2. Try to acquire global room lock
+            if self.acquire_lock():
+                try:
+                    pending_batch["status"] = "sending"
+                    self.current_push = pending_batch
+                    
+                    # 3. Tell server to notify receivers (Enqueuing pushes)
+                    headers = {"Authorization": f"Bearer {self.session_id}"}
+                    requests.post(
+                        f"{self.base_url}/transfer/queue",
+                        json={
+                            "target_devices": pending_batch["targets"],
+                            "files": pending_batch["files"]
+                        },
+                        headers=headers,
+                        timeout=5
+                    )
+                    
+                    # 4. Wait for all target devices to finish
+                    # We poll room info until all devices in room are 'idle' 
+                    # (except maybe us if we are technically the sender in some states)
+                    while not self._stop_heartbeat.is_set():
+                        time.sleep(2)
+                        info = self.get_room_info()
+                        if not info: break
+                        
+                        busy = False
+                        for d in info.get("devices", []):
+                             if d["state"] not in ("idle", "ready") and d["device_id"] != self.device_id:
+                                 busy = True
+                                 break
+                        
+                        if not busy:
+                            break
+                    
+                    pending_batch["status"] = "done"
+                    self.current_push = None
+                    self._notify(f"Transfer batch completed.")
+                finally:
+                    # 5. Release lock
+                    self.release_lock()
+            else:
+                # Lock busy, wait and retry
+                time.sleep(2)
     
     def get_room_info(self) -> dict:
         """Get current room information."""
@@ -246,23 +316,25 @@ class ShareClient:
             pass
     
     def queue_transfer(self, targets: List[str], files: List[dict]) -> bool:
-        """Tell room host to queue transfers for targets."""
-        if not self.session_id:
-            return False
+        """Add a transfer batch to the local private queue."""
+        # Clean files list for push notification
+        batch_files = []
+        for f in files:
+            batch_files.append({
+                "file_id": f["file_id"],
+                "name": f["name"],
+                "size": f["size"],
+                "is_dir": f.get("is_dir", False)
+            })
             
-        try:
-            response = requests.post(
-                f"{self.base_url}/transfer/queue",
-                json={
-                    "target_devices": targets,
-                    "files": files
-                },
-                headers={"Authorization": f"Bearer {self.session_id}"},
-                timeout=5
-            )
-            return response.status_code == 200
-        except Exception:
-            return False
+        self.send_queue.append({
+            "targets": targets,
+            "files": batch_files,
+            "status": "pending",
+            "time": time.time()
+        })
+        self._notify(f"Enqueued {len(files)} files for sending.")
+        return True
 
     def control_transfer(self, action: str, device_id: str) -> bool:
         """Send transfer control command (cancel/skip)."""
@@ -290,58 +362,53 @@ class ShareClient:
         self._heartbeat_thread.start()
     
     def _heartbeat_loop(self):
-        """Heartbeat loop to maintain presence and process pending transfers."""
-        active_share_dls = set()
+        """Heartbeat loop: 1.5s interval, fetches system logs and lock state."""
+        last_log_idx = -1
         
         while not self._stop_heartbeat.is_set():
             try:
-                # 1. Check current downloads status
-                if active_share_dls:
-                    from dlm.app.commands import ListDownloads
-                    all_dls = self.bus.handle(ListDownloads())
-                    still_active = set()
-                    for dl_id in active_share_dls:
-                        # Find the download in the list
-                        match = next((d for d in all_dls if d.id == dl_id), None)
-                        if match and match.status in ('downloading', 'pending', 'discovery'):
-                            still_active.add(dl_id)
-                    
-                    if not still_active and active_share_dls:
-                        # All shared downloads completed
-                        self.update_device_state("idle")
-                    
-                    active_share_dls = still_active
-
-                # 2. Send Heartbeat and get pending transfers
+                # 1. Update heartbeat and get updates
                 response = requests.post(
                     f"{self.base_url}/room/heartbeat",
-                    json={"device_id": self.device_id},
+                    json={
+                        "device_id": self.device_id,
+                        "last_log_idx": last_log_idx
+                    },
                     headers={"Authorization": f"Bearer {self.session_id}"},
                     timeout=5
                 )
                 
                 if response.status_code == 200:
                     data = response.json()
-                    pending = data.get("pending_transfers", [])
-                    for transfer in pending:
-                        if transfer.get("action") == "download":
-                            dl_id = self._handle_incoming_transfer(transfer)
-                            if dl_id:
-                                active_share_dls.add(dl_id)
-                        elif transfer.get("action") == "become_host":
-                            # Phase 16: Transition to Host
-                            from dlm.app.commands import TakeoverRoom
-                            self.bus.handle(TakeoverRoom(
-                                room_id=transfer["room_id"],
-                                token=transfer["token"],
-                                files=transfer.get("files", []),
-                                devices=transfer.get("devices", [])
-                            ))
+                    
+                    # Log updates
+                    logs = data.get("logs", [])
+                    if logs:
+                        for log in logs:
+                            # Notify TUI/Bus about system messages
+                            self._notify(f"{log['msg']}")
+                        last_log_idx = data.get("log_offset", last_log_idx)
+                    
+                    # Handle incoming pushes (Queued by others to us)
+                    queue = data.get("queue", [])
+                    for item in queue:
+                         if item.get("status") == "pending":
+                             self._handle_incoming_push(item)
+                             item["status"] = "downloading" # Local state (will be cleared by server)
+
             except Exception:
                 pass
             
-            # Wait 5 seconds between heartbeats (faster for responsiveness)
-            self._stop_heartbeat.wait(5)
+            # Wait 1.5 seconds
+            self._stop_heartbeat.wait(1.5)
+
+    def _handle_incoming_push(self, transfer: dict):
+        """Process an incoming 'push' (we are the receiver)."""
+        # Status bars ONLY in Transfer Status screen (handled by TUI)
+        dl_id = self._handle_incoming_transfer(transfer)
+        if dl_id:
+            from dlm.app.commands import ShareNotify
+            self._notify(f"Receiving: {transfer['name']}")
 
     def _handle_incoming_transfer(self, transfer: dict) -> Optional[str]:
         """Process an incoming transfer request. Returns the DL ID if started."""
@@ -356,7 +423,6 @@ class ShareClient:
                 sender_url
             )
         else:
-            # Handle Folder Unit
             return self._start_folder_download(
                 transfer["file_id"],
                 transfer["name"],
@@ -394,7 +460,6 @@ class ShareClient:
         
         if dl_id:
             self.bus.handle(StartDownload(id=dl_id))
-            self.update_device_state("receiving")
             return dl_id
         return None
 
@@ -414,7 +479,6 @@ class ShareClient:
             for item in items:
                 # We prefix the relative path with the folder name to recreate structure
                 rel_path = item["rel_path"]
-                full_rel_path = os.path.join(folder_name, rel_path)
                 dl_id = self._start_single_download(folder_id, folder_name, item["size"], sender_url, sub_path=rel_path)
                 if not first_dl_id:
                     first_dl_id = dl_id
@@ -423,6 +487,32 @@ class ShareClient:
         except Exception:
             return None
     
+    def acquire_lock(self) -> bool:
+        """Attempt to acquire the global room transfer lock."""
+        try:
+            response = requests.post(
+                f"{self.base_url}/room/lock/acquire",
+                json={"device_id": self.device_id},
+                headers={"Authorization": f"Bearer {self.session_id}"},
+                timeout=5
+            )
+            return response.json().get("status") == "acquired"
+        except:
+            return False
+
+    def release_lock(self) -> bool:
+        """Release the global room transfer lock."""
+        try:
+            response = requests.post(
+                f"{self.base_url}/room/lock/release",
+                json={"device_id": self.device_id},
+                headers={"Authorization": f"Bearer {self.session_id}"},
+                timeout=5
+            )
+            return response.json().get("status") == "released"
+        except:
+            return False
+
     def leave_room(self, ip: str = None, port: int = None, token: str = None):
         """Explicitly notify host that we are leaving."""
         # Use session defaults if not provided
@@ -437,7 +527,6 @@ class ShareClient:
             device_id = self.device_id or "UNKNOWN"
             headers = {"Authorization": f"Bearer {self.session_id}"} if self.session_id else {}
             requests.post(url, json={"device_id": device_id}, headers=headers, timeout=2)
-            self._notify("Left room.")
         except:
             pass
 

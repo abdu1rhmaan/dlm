@@ -15,17 +15,17 @@ class Device:
     ip: str
     state: str = "idle"  # idle, sending, receiving
     last_seen: Optional[datetime] = None
-    pending_transfers: List[dict] = field(default_factory=list) # Phase 2 Coordination
+    queue: List[dict] = field(default_factory=list) # Per-device PRIVATE queue
     current_transfer: Optional[dict] = None # {file_id, name, progress, speed, size}
     
-    def is_active(self, timeout_seconds: int = 30) -> bool:
+    def is_active(self, timeout_seconds: int = 5) -> bool:
         """Check if device is still active (seen recently)."""
-        # Treat (you) or the host as always active if it's the current session
+        # Host/Self is always active if the UI is running
         if "(you)" in self.name or self.device_id == "HOST":
             return True
         if not self.last_seen:
             return False
-        return datetime.now() - self.last_seen < timedelta(seconds=timeout_seconds)
+        return (datetime.now() - self.last_seen).total_seconds() < timeout_seconds
     
     def update_heartbeat(self):
         """Update last_seen timestamp."""
@@ -41,11 +41,24 @@ class Room:
     port: int
     host_device_name: str = "Host"
     host_device_id: str = "HOST"
-    owner_device_id: str = "HOST" # Phase 16: Tracks authority for handover
+    owner_device_id: str = "HOST" 
     devices: List[Device] = field(default_factory=list)
+    system_log: List[dict] = field(default_factory=list) # [{time, msg, type}]
+    transfer_lock: Optional[str] = None # device_id of current SENDER
     created_at: datetime = field(default_factory=datetime.now)
     ttl: int = 86400  # 24 hours default
     
+    def add_log(self, msg: str, log_type: str = "info"):
+        """Add a system message to the log."""
+        self.system_log.append({
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "msg": msg,
+            "type": log_type
+        })
+        # Keep last 50 messages
+        if len(self.system_log) > 50:
+            self.system_log.pop(0)
+
     @staticmethod
     def generate_room_id() -> str:
         """Generate a 4-character room ID (e.g., X7K2)."""
@@ -65,14 +78,21 @@ class Room:
         return datetime.now() - self.created_at > timedelta(seconds=self.ttl)
     
     def add_device(self, device: Device):
-        """Add or update a device in the room."""
+        """Add or update a device in the room with logging."""
+        existing = self.get_device(device.device_id)
+        if not existing:
+            self.add_log(f"[+] {device.name} joined the room", "join")
+        
         # Remove existing device with same ID
         self.devices = [d for d in self.devices if d.device_id != device.device_id]
         device.update_heartbeat()
         self.devices.append(device)
     
     def remove_device(self, device_id: str):
-        """Remove a device from the room."""
+        """Remove a device with logging."""
+        device = self.get_device(device_id)
+        if device:
+            self.add_log(f"[-] {device.name} left the room", "leave")
         self.devices = [d for d in self.devices if d.device_id != device_id]
     
     def get_device(self, device_id: str) -> Optional[Device]:
@@ -93,8 +113,15 @@ class Room:
             device.state = state
             device.update_heartbeat()
 
-    def prune_stale_devices(self, timeout_seconds: int = 60) -> bool:
-        """Remove devices not seen for a while. Returns True if any removed."""
+    def prune_stale_devices(self, timeout_seconds: int = 5) -> bool:
+        """Remove devices not seen for a while with logging."""
         old_count = len(self.devices)
-        self.devices = [d for d in self.devices if d.is_active(timeout_seconds)]
+        active_devices = []
+        for d in self.devices:
+            if d.is_active(timeout_seconds):
+                active_devices.append(d)
+            else:
+                self.add_log(f"[!] {d.name} disconnected", "timeout")
+        
+        self.devices = active_devices
         return len(self.devices) != old_count

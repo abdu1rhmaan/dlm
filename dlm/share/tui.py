@@ -5,6 +5,8 @@ import threading
 import time
 from pathlib import Path
 from typing import List, Optional, Callable, Any, Dict
+import uuid
+import os
 
 from prompt_toolkit.application import Application, get_app
 from prompt_toolkit.layout import Layout, HSplit, VSplit, Window, FormattedTextControl, Dimension, ConditionalContainer
@@ -50,8 +52,8 @@ class ShareTUI:
         
         # Data
         self.discovered_rooms = []
-        self.target_device_id = "ALL"  # ALL or specific ID
-        self.persistent_transfers = {} # device_id -> { "name": ..., "progress": ... }
+        self.target_device_id = "ALL"
+        self.system_logs = [] # [log1, log2, ...]
         
         # Inputs
         self.input_field = TextArea(multiline=False, password=False)
@@ -120,11 +122,16 @@ class ShareTUI:
             pass
 
     def _handle_share_notify(self, command):
-        """Update notification msg/error box."""
+        """Update notification msg/error box and system logs."""
         if command.is_error:
             self._set_error(command.message)
         else:
             self._set_msg(command.message)
+            # Add to system logs for Lobby display
+            self.system_logs.append(command.message)
+            if len(self.system_logs) > 50:
+                self.system_logs.pop(0)
+
         try:
             get_app().invalidate()
         except: pass
@@ -216,14 +223,17 @@ class ShareTUI:
         self._set_msg(f"Items added. (Shared: {self._get_files_count()})")
 
     def _refresh_loop(self):
-        while self.running:
             try:
-                if self.screen == "lobby" and self.client:
+                if self.screen in ("lobby", "transfer_status") and self.client:
                     # Poll host for updates
                     data = self.client.get_room_info() 
                     if data:
                         self._sync_room_state(data)
                 
+                # HEARTBEAT already fetches logs via ShareClient loop
+                # and calls _notify which calls _handle_share_notify
+                # So we don't need to poll logs here.
+
                 # Check message TTL
                 if self.last_msg and (time.time() - self.last_msg_time > 2.0):
                     self.last_msg = ""
@@ -237,7 +247,7 @@ class ShareTUI:
             except Exception:
                 pass
             
-            time.sleep(1.5) # Slower poll to reduce load
+            time.sleep(1.0) # Slightly faster poll for UI snappiness
 
     def _get_files_count(self) -> int:
         if self.server:
@@ -327,8 +337,9 @@ class ShareTUI:
     def _get_lobby_actions(self):
         return [
             ("add", "Add Files / Folders"),
-            ("view", "View Shared Files"),
-            ("queue", "Open Queue / Send Files"),
+            ("view", "View Shared Files (Read-only)"),
+            ("queue", "Manage Queue / Send"),
+            ("status", "Transfer Status Screen"),
             ("qr", "Show Room QR"),
             ("leave", "Leave Room")
         ]
@@ -365,7 +376,6 @@ class ShareTUI:
 
     def _get_lobby_file_actions(self):
         return [
-            ("download_all", "Download All Files"),
             ("back", "Back to Lobby Info")
         ]
 
@@ -386,15 +396,17 @@ class ShareTUI:
             room = self.room_manager.current_room
             if not room: return
             
-            action = self._get_lobby_actions()[self.list_index][0]
+            actions = self._get_lobby_actions()
+            if self.list_index >= len(actions): self.list_index = 0
+            action = actions[self.list_index][0]
+            
             if action == "add": self._add_files()
-            elif action == "copy": self._copy_invite_link()
             elif action == "view": 
                 if self.client: self.client.get_room_info()
                 self.screen = "lobby_files"; self.list_index = 0
             elif action == "queue": self.screen = "queue"; self.list_index = 0
+            elif action == "status": self.screen = "transfer_status"; self.list_index = 0
             elif action == "qr": self.screen = "qr"; self.list_index = 0
-            elif action == "refresh": self._do_refresh()
             elif action == "leave": self._leave_room()
 
         elif self.screen == "queue":
@@ -429,14 +441,11 @@ class ShareTUI:
         elif self.screen == "lobby_files":
             files = self.client.room_files if self.client else []
             if self.list_index < len(files):
-                 # Toggle selection? For now just download one
-                 f = files[self.list_index]
-                 self._download_files([f])
+                 self._set_msg("Note: Downloads are push-only. Ask owner to send.")
             else:
                  action_idx = self.list_index - len(files)
                  action = self._get_lobby_file_actions()[action_idx][0]
-                 if action == "download_all": self._download_files(files)
-                 elif action == "back": self.screen = "lobby"; self.list_index = 0
+                 if action == "back": self.screen = "lobby"; self.list_index = 0
 
     def _do_join(self, ip: str, port: int, token: str):
         """Join a room in the background."""
@@ -527,8 +536,9 @@ class ShareTUI:
                 item.status = "transferring"
         
         if files_data:
-            self.client.queue_transfer(["SPECIAL_MULTIPER"], files_data) # Use a flag if server supports per-file targets
-            self.last_msg = f"Transfer started for {len(files_data)} items."
+            # Add to local send_queue (ShareClient handles the rest)
+            self.client.queue_transfer(["ALL"], files_data)
+            self.last_msg = f"Enqueued {len(files_data)} items for sending."
             self.screen = "lobby"; self.list_index = 0
         else:
             self.last_error = "No pending files found."
@@ -550,7 +560,7 @@ class ShareTUI:
              self.screen = "lobby"; self.list_index = 0
         elif self.screen == "qr_join":
              self.screen = "main"; self.list_index = 0
-        elif self.screen in ("qr", "lobby_files"):
+        elif self.screen in ("qr", "lobby_files", "transfer_status"):
              self.screen = "lobby"; self.list_index = 0
 
     def _copy_invite_link(self):
@@ -807,6 +817,10 @@ class ShareTUI:
                 )
                 new_devices.append(dev)
             room.devices = new_devices
+        
+        # Sync Lock
+        if "transfer_lock" in data:
+            room.transfer_lock = data["transfer_lock"]
             
         # Sync files
         if "files" in data:
@@ -849,6 +863,7 @@ class ShareTUI:
         elif self.screen == "scan_results": return self._render_scan_results()
         elif self.screen == "manual_join": return self._render_manual_join()
         elif self.screen == "lobby_files": return self._render_lobby_files()
+        elif self.screen == "transfer_status": return self._render_transfer_status()
         elif self.screen == "qr_join": return HTML(" <header>Join via URL</header>\n\n [Please paste the HTTP invite link here]")
         return HTML("Loading...")
 
@@ -913,31 +928,13 @@ class ShareTUI:
         room = self.room_manager.current_room
         if not room: return HTML("Error: Room lost")
         
-        # --- HEADER / STATUS ---
-        pending_count = len([f for f in self.queue.queue if f.status == "pending"])
-        
         lines = [
             f" <header>DLM SHARE ROOM</header>  ID: <room-id>{room.room_id}</room-id>  |  TOKEN: <msg>{room.token}</msg>",
             f" <header>Invite:</header> <msg>http://{room.host_ip}:{room.port}/invite?t={room.token}</msg>",
-            f" Status: <msg>Lobby Active</msg>  |  Queue: <msg>{pending_count}</msg>",
+            f" Status: <msg>Lobby Active</msg>  |  Transfer Lock: <msg>{'LOCKED' if room.transfer_lock else 'FREE'}</msg>",
             " " + "─"*60
         ]
         
-        # --- TOTAL PROGRESS (Unified) ---
-        active_transfers = [
-            d.current_transfer for d in room.devices 
-            if d.current_transfer and (d.current_transfer.get('speed', 0) > 0 or d.current_transfer.get('progress', 0) > 0)
-        ]
-        if active_transfers:
-            total_prog = sum(t.get('progress', 0) for t in active_transfers) / len(active_transfers)
-            total_speed = sum(t.get('speed', 0.0) for t in active_transfers)
-            
-            width = 40
-            filled = int(total_prog / 100 * width)
-            bar = "█" * filled + "░" * (width - filled)
-            lines.append(f" <header>TOTAL PROGRESS:</header> <msg>[{bar}] {total_prog:.1f}% ({total_speed:.2f} MB/s)</msg>")
-            lines.append(" " + "─"*60)
-
         # Display Devices
         devices = room.devices
         lines.append(" <header>Connected Devices:</header>")
@@ -950,23 +947,21 @@ class ShareTUI:
                 active_mark = "●" if d.is_active() else "○"
                 status_txt = f"[{d.state}]"
                 lines.append(f"  <{style}>{active_mark} {d.name[:18]:<18} {status_txt:<12} {d.ip}</{style}>")
-                
-                if d.current_transfer and d.is_active():
-                    t = d.current_transfer
-                    prog = t.get('progress', 0)
-                    speed = t.get('speed', 0.0)
-                    
-                    if speed > 0 or prog > 0:
-                        name = t.get('name', 'file')
-                        # Mini progress bar
-                        width = 20
-                        filled = int(prog / 100 * width)
-                        bar = "█" * filled + "░" * (width - filled)
-                        lines.append(f"      <msg>└ {name[:25]:<25} [{bar}] {prog:.1f}% ({speed:.1f} MB/s)</msg>")
+
+        lines.append(" " + "─"*60)
+
+        # System Logs (Bottom small window in Lobby)
+        lines.append(" <header>Recent Events:</header>")
+        logs = self.system_logs[-4:] # Last 4 logs
+        if not logs:
+            lines.append("  <i>Waiting for events...</i>")
+        else:
+            for log in logs:
+                lines.append(f"  <msg>{log}</msg>")
 
         lines.append(" " + "─"*50)
         
-        # --- ACTION MENU (Selectable) ---
+        # --- ACTION MENU ---
         lines.append(" <header>Actions:</header>")
         
         actions = self._get_lobby_actions()
@@ -981,6 +976,51 @@ class ShareTUI:
         if self.last_error:
              lines.append(f"\n <error>{self.last_error}</error>")
              
+        return HTML("\n".join(lines))
+
+    def _render_transfer_status(self):
+        """Dedicated screen for progress bars and transfer coordination."""
+        room = self.room_manager.current_room
+        if not room: return HTML("ERROR")
+
+        lines = ["<header>TRANSFER STATUS (GLOBAL)</header>", ""]
+        
+        lock_owner = room.transfer_lock
+        if lock_owner:
+            owner_dev = room.get_device(lock_owner)
+            owner_name = owner_dev.name if owner_dev else lock_owner
+            lines.append(f" <header>Active Sender:</header> <msg>{owner_name}</msg>")
+            lines.append(" Only one device can send at a time. All others wait.")
+        else:
+            lines.append(" <header>Room Lock:</header> <msg>FREE</msg>")
+            lines.append(" No active transfers in the room.")
+
+        lines.append("\n" + "─"*60 + "\n")
+
+        # Find any busy devices
+        busy_devices = [d for d in room.devices if d.state not in ("idle", "ready")]
+        
+        if not busy_devices:
+            lines.append(" <i>Room is currently idle.</i>")
+        else:
+            for d in busy_devices:
+                lines.append(f" <header>{d.device_id[:8]:<8}</header> {d.name[:15]:<15} [{d.state}]")
+                if d.current_transfer:
+                    t = d.current_transfer
+                    prog = t.get('progress', 0)
+                    speed = t.get('speed', 0.0)
+                    name = t.get('name', 'file')
+                    
+                    width = 40
+                    filled = int(prog / 100 * width)
+                    bar = "█" * filled + "░" * (width - filled)
+                    lines.append(f"  <msg>File: {name[:30]}</msg>")
+                    lines.append(f"  <msg>[{bar}] {prog:.1f}% ({speed:.1f} MB/s)</msg>")
+                    lines.append("")
+
+        lines.append("\n" + "─"*60 + "\n")
+        lines.append(" <i>Press 'q' or 'esc' to return to Lobby.</i>")
+        
         return HTML("\n".join(lines))
 
     def _render_queue(self):

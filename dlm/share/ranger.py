@@ -11,6 +11,7 @@ from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.widgets import Frame
 from prompt_toolkit.styles import Style
 from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.filters import Condition
 
 
 class RangerBrowser:

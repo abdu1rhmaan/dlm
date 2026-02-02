@@ -1,19 +1,17 @@
-from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi import FastAPI, HTTPException, Request, Depends, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import socket
 import threading
 import asyncio
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Callable, Any
 import os
 from datetime import datetime
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Request, Depends, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
 import json
 import secrets
+import uuid
 
 from .models import FileEntry
 from .auth import AuthManager
@@ -101,6 +99,9 @@ class ShareServer:
         """Helper to get full serialized room state."""
         if not self.room: return {}
         
+        # Prune stale devices before getting state
+        self.room.prune_stale_devices(timeout_seconds=5)
+        
         return {
             "room_id": self.room.room_id,
             "host": f"{self.room.host_ip}:{self.port}",
@@ -116,21 +117,21 @@ class ShareServer:
                 for f in self.file_entries
             ],
             "owner_device_id": self.room.owner_device_id,
+            "transfer_lock": self.room.transfer_lock,
             "devices": [
                 {
                     "device_id": d.device_id,
                     "name": d.name, 
                     "state": d.state, 
                     "ip": d.ip, 
-                    "is_active": d.is_active(),
+                    "is_active": d.is_active(timeout_seconds=5),
                     "current_transfer": d.current_transfer
                 }
                 for d in self.room.devices
             ],
             "transfer": {
-                "active": self.total_bytes_sent > 0,
-                "progress": (self.total_bytes_sent / sum(f.size_bytes for f in self.file_entries) * 100) if self.file_entries and sum(f.size_bytes for f in self.file_entries) > 0 else 0,
-                "speed": getattr(self, 'current_speed', 0)
+                "active": self.room.transfer_lock is not None,
+                "sender": self.room.transfer_lock
             }
         }
         
@@ -341,7 +342,6 @@ class ShareServer:
                         state="idle"
                     )
                     self.room.add_device(new_dev)
-                    self._notify(f"Web browser joined: {ip}")
                     asyncio.create_task(self.broadcast_state())
 
             return self.get_full_state()
@@ -373,10 +373,7 @@ class ShareServer:
                 raise HTTPException(status_code=400, detail="device_id required")
             
             if self.room:
-                # If host is leaving, we might want to notify or trigger handover
-                # For now, just remove
                 self.room.remove_device(device_id)
-                self._notify(f"Device left: {device_id}")
                 asyncio.create_task(self.broadcast_state())
             
             return {"status": "ok"}
@@ -386,6 +383,12 @@ class ShareServer:
         async def download_file(file_id: str, request: Request, session_id: Optional[str] = Depends(verify_session)):
             if not session_id:
                  raise HTTPException(status_code=401, detail="Unauthorized")
+
+            # Push-Only: Verify that sender has the room lock
+            # Actually, server is always the one SENDING in this API model
+            # but we should ensure the ROOM has a lock if it's a coordinated transfer.
+            # However, direct downloads (pull) are being discouraged.
+            # We keep the endpoint but UI will remove the pull triggers.
 
             fe = self._get_file_by_id(file_id)
             if not fe:
@@ -400,7 +403,7 @@ class ShareServer:
                 "Accept-Ranges": "bytes"
             }
             
-            self._notify(f"Transfer started: {fe.name} -> {request.client.host}")
+            # self._notify(f"Transfer started: {fe.name} -> {request.client.host}")
             
             if self.bus and self.upload_task_id:
                  self.bus.handle(UpdateExternalTask(
@@ -495,7 +498,7 @@ class ShareServer:
         
         @self.app.post("/room/join")
         async def join_room(request: Request):
-            """Join the room as a new device."""
+            """Join the room as a new device with persistent presence."""
             if not self.room:
                 raise HTTPException(status_code=404, detail="No room available")
             
@@ -507,21 +510,7 @@ class ShareServer:
             if not device_name or not device_ip:
                 raise HTTPException(status_code=400, detail="device_name and device_ip required")
             
-            # 1. Check if this is the host itself re-joining (e.g. from TUI)
-            if device_ip == self.room.host_ip and (device_id == self.room.host_device_id or device_id == "HOST" or "(you)" in device_name.lower()):
-                 # Update host state instead of adding new device
-                 for d in self.room.devices:
-                      if "(you)" in d.name or d.device_id == self.room.host_device_id:
-                           d.update_heartbeat()
-                           # Ensure name still has (you)
-                           if "(you)" not in d.name: d.name += " (you)"
-                           return {
-                               "room_id": self.room.room_id,
-                               "device_id": d.device_id,
-                               "status": "active"
-                           }
-
-            # 2. Use provided ID or generate new one
+            # Use provided ID or generate new one
             if not device_id:
                 import uuid
                 device_id = str(uuid.uuid4())[:8]
@@ -534,7 +523,6 @@ class ShareServer:
             )
             
             self.room.add_device(device)
-            # Broadcast join event
             asyncio.create_task(self.broadcast_state())
             
             return {
@@ -545,12 +533,13 @@ class ShareServer:
         
         @self.app.post("/room/heartbeat")
         async def heartbeat(request: Request):
-            """Update device heartbeat timestamp and return pending transfers."""
+            """Update device heartbeat and return system logs + lock status."""
             if not self.room:
                 raise HTTPException(status_code=404, detail="No room available")
             
             data = await request.json()
             device_id = data.get("device_id")
+            last_log_idx = data.get("last_log_idx", -1)
             
             if not device_id:
                 raise HTTPException(status_code=400, detail="device_id required")
@@ -561,15 +550,46 @@ class ShareServer:
             
             device.update_heartbeat()
             
-            # Return and clear pending transfers
-            pending = list(device.pending_transfers)
-            device.pending_transfers.clear()
+            # New system logs for this client
+            new_logs = self.room.system_log[last_log_idx + 1:]
             
             return {
                 "status": "ok",
-                "pending_transfers": pending
+                "logs": new_logs,
+                "log_offset": len(self.room.system_log) - 1,
+                "transfer_lock": self.room.transfer_lock,
+                "queue": device.queue # Return per-device PRIVATE queue updates
             }
         
+        @self.app.post("/room/lock/acquire")
+        async def acquire_lock(request: Request, session_id: str = Depends(verify_session)):
+            """Atomically acquire the room transfer lock."""
+            if not session_id: raise HTTPException(status_code=401)
+            data = await request.json()
+            device_id = data.get("device_id")
+            
+            with self._lock:
+                if self.room.transfer_lock and self.room.transfer_lock != device_id:
+                    return {"status": "locked", "owner": self.room.transfer_lock}
+                
+                self.room.transfer_lock = device_id
+                asyncio.create_task(self.broadcast_state())
+                return {"status": "acquired"}
+
+        @self.app.post("/room/lock/release")
+        async def release_lock(request: Request, session_id: str = Depends(verify_session)):
+            """Release the room transfer lock."""
+            if not session_id: raise HTTPException(status_code=401)
+            data = await request.json()
+            device_id = data.get("device_id")
+            
+            with self._lock:
+                if self.room.transfer_lock == device_id:
+                    self.room.transfer_lock = None
+                    asyncio.create_task(self.broadcast_state())
+                    return {"status": "released"}
+            return {"status": "not_owner"}
+
         @self.app.post("/room/state")
         async def update_device_state(request: Request):
             """Update device state (idle/sending/receiving)."""
@@ -613,7 +633,6 @@ class ShareServer:
                     count += 1
             
             if count > 0:
-                self._notify(f"Node {device_id} announced {count} new files.")
                 asyncio.create_task(self.broadcast_state())
                 
             return {"status": "ok", "added": count}
@@ -633,7 +652,7 @@ class ShareServer:
                 raise HTTPException(status_code=400, detail="Missing handover details")
                 
             self.room.owner_device_id = new_owner_id
-            self._notify(f"Room ownership migrating to {new_owner_id}...")
+            self.room.add_log(f"Room ownership migrating to {new_owner_id}...")
             
             # Phase 16: Track migration for polling clients
             self._migrating_to = {
@@ -667,7 +686,7 @@ class ShareServer:
 
         @self.app.post("/transfer/queue")
         async def queue_transfer(request: Request, session_id: str = Depends(verify_session)):
-            """Coordinate multi-file transfer queue."""
+            """Coordinate multi-file push transfer queue (PRIVATE per device)."""
             if not session_id:
                 raise HTTPException(status_code=401, detail="Unauthorized")
             
@@ -675,26 +694,23 @@ class ShareServer:
             target_device_ids = data.get("target_devices", [])
             files = data.get("files", [])
             
-            # Phase 2: Per-file targeting
-            multi_target = target_device_ids == ["SPECIAL_MULTIPER"]
-
             for f in files:
                 file_info = {
-                    "action": "download",
+                    "action": "push",
                     "file_id": f["file_id"],
                     "name": f["name"],
                     "size": f["size"],
                     "sender_ip": self.room.host_ip,
                     "sender_port": self.port,
-                    "is_dir": f.get("is_dir", False)
+                    "is_dir": f.get("is_dir", False),
+                    "status": "pending"
                 }
                 
-                targets = f.get("targets", target_device_ids) if multi_target else target_device_ids
-                
-                for device_id in targets:
+                for device_id in target_device_ids:
                     device = self.room.get_device(device_id)
                     if device:
-                        device.pending_transfers.append(file_info)
+                        # Append to that specific device's PRIVATE queue
+                        device.queue.append(file_info)
             
             return {"status": "queued"}
 
