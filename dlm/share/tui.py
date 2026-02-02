@@ -6,9 +6,10 @@ import time
 from pathlib import Path
 from typing import List, Optional, Callable, Any, Dict
 
-from prompt_toolkit import Application
-from prompt_toolkit.layout import Layout, HSplit, VSplit, Window, FormattedTextControl, Dimension
+from prompt_toolkit.application import Application, get_app
+from prompt_toolkit.layout import Layout, HSplit, VSplit, Window, FormattedTextControl, Dimension, ConditionalContainer
 from prompt_toolkit.widgets import Frame, Label, Button, RadioList, Box, TextArea
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.formatted_text import HTML, FormattedText
 from prompt_toolkit.styles import Style
@@ -39,12 +40,18 @@ class ShareTUI:
         self.menu_index = 0
         self.list_index = 0
         self.running = True
-        self.last_error = None
-        self.last_msg = None
+        self.last_msg = ""
+        self.last_msg_time = 0.0 # TTL for messages
+        self._direct_mode = False
+        self.last_error = ""
+        
+        self.body_control = FormattedTextControl(self._get_content, focusable=True)
+        self.body_window = Window(content=self.body_control, height=Dimension(min=10))
         
         # Data
         self.discovered_rooms = []
-        self.targeting_item_index = -1
+        self.target_device_id = "ALL"  # ALL or specific ID
+        self.persistent_transfers = {} # device_id -> { "name": ..., "progress": ... }
         
         # Inputs
         self.input_field = TextArea(multiline=False, password=False)
@@ -69,6 +76,101 @@ class ShareTUI:
         
         # Background refreshing
         self.refresh_thread = threading.Thread(target=self._refresh_loop, daemon=True)
+
+    def _set_msg(self, msg: str):
+        self.last_msg = msg
+        self.last_msg_time = time.time()
+        # Clear error when new msg arrives
+        self.last_error = ""
+        try:
+            get_app().invalidate()
+        except:
+            pass
+
+    def _set_error(self, err: str):
+        self.last_error = err
+        self.last_msg = ""
+        self.last_msg_time = time.time() # Errors also TTL?
+        try:
+            get_app().invalidate()
+        except:
+            pass
+
+
+    def _do_refresh(self):
+        """Force refresh of room state (non-blocking)."""
+        self._set_msg("Refreshing...")
+        
+        def _refresh_bg():
+            if self.client:
+                try:
+                    self.client.get_room_info()
+                except:
+                    pass
+            # Clear message after refresh
+            time.sleep(0.3)
+            self._set_msg("")
+            try:
+                get_app().invalidate()
+            except:
+                pass
+        
+        # Run in background to avoid freeze
+        threading.Thread(target=_refresh_bg, daemon=True).start()
+
+    def _add_files(self):
+        """Invoke ranger file picker."""
+        def on_add(path: Path, as_folder: bool = False) -> int:
+             # Add to transfer queue (for push)
+             count = self.queue.add_path(path, as_folder=as_folder)
+             
+             if self.server and self.room_manager.current_room:
+                 try:
+                     fe = FileEntry.from_path(str(path))
+                     fe.owner_device_id = self.room_manager.device_id
+                     # Deduplicate
+                     if not any(f.file_id == fe.file_id for f in self.server.file_entries):
+                         self.server.file_entries.append(fe)
+                         # Broadcast update
+                         if self.server and self.server.ws_manager and self.server.ws_manager.loop:
+                             asyncio.run_coroutine_threadsafe(self.server.broadcast_state(), self.server.ws_manager.loop)
+                 except Exception:
+                     pass
+                     
+             return count
+        
+        launch_picker(on_add)
+        self._set_msg(f"Items added. (Shared: {self._get_files_count()})")
+
+    def _refresh_loop(self):
+        while self.running:
+            try:
+                if self.screen == "lobby" and self.client:
+                    # Poll host for updates
+                    self.client.get_room_info() 
+                
+                # Check message TTL
+                if self.last_msg and (time.time() - self.last_msg_time > 2.0):
+                    self.last_msg = ""
+                    get_app().invalidate()
+                    
+                # Fix: Check error TTL if desired, or leave persistent
+                if self.last_error and (time.time() - self.last_msg_time > 4.0):
+                    self.last_error = "" # longer TTL for errors
+                    get_app().invalidate()
+
+            except Exception:
+                pass
+            
+            time.sleep(1.5) # Slower poll to reduce load
+
+    def _get_files_count(self) -> int:
+        if self.server:
+            return len(self.server.file_entries)
+        if self.client:
+            return len(self.client.room_files)
+        return 0
+
 
     def _setup_keybindings(self):
         @self.kb.add('up')
@@ -96,13 +198,27 @@ class ShareTUI:
             else:
                 self._handle_enter()
 
-        @self.kb.add('q')
-        @self.kb.add('esc')
+        @self.kb.add('delete', filter=~Condition(lambda: get_app().layout.has_focus(self.input_field)))
+        @self.kb.add('x', filter=~Condition(lambda: get_app().layout.has_focus(self.input_field)))
+        def _(event):
+            if self.screen == "queue":
+                if len(self.queue) > 0 and self.list_index < len(self.queue):
+                    self.queue.queue.pop(self.list_index)
+                    if self.list_index >= len(self.queue) and len(self.queue) > 0:
+                        self.list_index = len(self.queue) - 1
+                    self._set_msg("Item removed from queue.")
+            elif self.screen == "lobby_files":
+                 # Maybe allow hiding? For now just msg
+                 pass
+
+        @self.kb.add('q', filter=~Condition(lambda: get_app().layout.has_focus(self.input_field)))
+        @self.kb.add('escape')
         def _(event):
             if event.app.layout.has_focus(self.input_field):
-                event.app.layout.focus(Window(content=FormattedTextControl(self._get_content))) # Focus back to main area
-                return
-            self._handle_back(event)
+                # If typing, just unfocus
+                event.app.layout.focus(self.body_window)
+            else:
+                self._handle_back(event)
 
     def _handle_input_accept(self, buffer):
         text = buffer.text.strip()
@@ -123,43 +239,54 @@ class ShareTUI:
             self._join_from_qr(text)
         
         buffer.reset()
-        Application.get_current().layout.focus(Window(content=FormattedTextControl(self._get_content))) 
+        get_app().layout.focus(self.body_window) 
 
     # Actions at bottom of lists
+    def _get_lobby_actions(self):
+        return [
+            ("add", "Add Files / Folders"),
+            ("copy", "Copy Invite Link"),
+            ("view", "Download from Others"),
+            ("queue", "Open Queue / Send Files"),
+            ("qr", "Show Room QR"),
+            ("refresh", "Refresh Status"),
+            ("leave", "Leave Room")
+        ]
+
     def _get_queue_actions(self):
         return [
-            ("send", "[S] Send All Pending"),
-            ("clear", "[C] Clear Completed"),
-            ("back", "[B] Back to Lobby")
+            ("send", "Send All Pending"),
+            ("clear", "Clear Completed"),
+            ("back", "Back to Lobby")
         ]
 
     def _get_current_list_count(self) -> int:
         if self.screen == "main":
             return len(self._get_main_menu_items())
         elif self.screen == "lobby":
-            return len(self.room_manager.current_room.devices) + len(self._get_lobby_actions())
+            # ONLY Action Menu is selectable
+            return len(self._get_lobby_actions())
         elif self.screen == "queue":
             return len(self.queue) + len(self._get_queue_actions())
         elif self.screen == "scan_results":
             return len(self.discovered_rooms)
+        elif self.screen == "lobby_files":
+            files = self.client.room_files if self.client else []
+            return len(files) + len(self._get_lobby_file_actions())
         return 0
 
     def _get_main_menu_items(self):
         return [
             ("create", "Create Room (Host)"),
-            ("scan", "Scan for Rooms"),
-            ("join", "Join Manually (IP/Token)"),
-            ("qr", "Join via QR Paste"),
+            ("scan", "Scan for Rooms (Auto)"),
             ("exit", "Exit")
         ]
 
-    def _get_lobby_actions(self):
+
+    def _get_lobby_file_actions(self):
         return [
-            ("add", "[+] Add Files/Folders"),
-            ("queue", "[Q] Manage Queue / Send"),
-            ("qr", "[S] Show Room QR"),
-            ("refresh", "[R] Refresh List"),
-            ("leave", "[L] Leave Room")
+            ("download_all", "Download All Files"),
+            ("back", "Back to Lobby Info")
         ]
 
     def _handle_enter(self):
@@ -168,13 +295,7 @@ class ShareTUI:
             action = items[self.list_index][0]
             if action == "create": self._create_room()
             elif action == "scan": self._scan_rooms()
-            elif action == "join": 
-                self.screen = "manual_join"
-                Application.get_current().layout.focus(self.input_field)
-            elif action == "qr": 
-                self.screen = "qr_join"
-                Application.get_current().layout.focus(self.input_field)
-            elif action == "exit": self.running = False; Application.get_current().exit()
+            elif action == "exit": self.running = False; get_app().exit()
         
         elif self.screen == "scan_results":
             if self.discovered_rooms and self.list_index < len(self.discovered_rooms):
@@ -182,30 +303,82 @@ class ShareTUI:
                 self._do_join(room['ip'], room['port'], room['token'])
 
         elif self.screen == "lobby":
-            devices = self.room_manager.current_room.devices
-            if self.list_index < len(devices):
-                pass
-            else:
-                action_idx = self.list_index - len(devices)
-                action = self._get_lobby_actions()[action_idx][0]
-                if action == "add": self._add_files()
-                elif action == "queue": self.screen = "queue"; self.list_index = 0
-                elif action == "qr": self._show_qr()
-                elif action == "refresh": pass
-                elif action == "leave": self._leave_room()
+            room = self.room_manager.current_room
+            if not room: return
+            
+            action = self._get_lobby_actions()[self.list_index][0]
+            if action == "add": self._add_files()
+            elif action == "copy": self._copy_invite_link()
+            elif action == "view": 
+                if self.client: self.client.get_room_info()
+                self.screen = "lobby_files"; self.list_index = 0
+            elif action == "queue": self.screen = "queue"; self.list_index = 0
+            elif action == "qr": self.screen = "qr"; self.list_index = 0
+            elif action == "refresh": self._do_refresh()
+            elif action == "leave": self._leave_room()
 
         elif self.screen == "queue":
+            room = self.room_manager.current_room
+            devices = room.devices if room else []
+            other_devices = [d for d in devices if "(you)" not in d.name]
+            device_ids = ["ALL"] + [d.device_id for d in other_devices]
+
             if self.list_index < len(self.queue):
-                # Toggle skip/remove? 
                 item = self.queue.queue[self.list_index]
-                if item.status == "pending":
-                    self.queue.remove_item(self.list_index)
+                # Toggle through devices (excluding self)
+                try:
+                    curr_idx = device_ids.index(item.target_device_id)
+                    next_idx = (curr_idx + 1) % len(device_ids)
+                    next_target = device_ids[next_idx]
+                    
+                    # Ensure we don't target self
+                    if next_target == self.room_manager.device_id and len(device_ids) > 1:
+                        next_idx = (next_idx + 1) % len(device_ids)
+                        next_target = device_ids[next_idx]
+                    
+                    item.target_device_id = next_target
+                except ValueError:
+                    item.target_device_id = "ALL"
             else:
                 action_idx = self.list_index - len(self.queue)
                 action = self._get_queue_actions()[action_idx][0]
                 if action == "send": self._execute_queue_transfer()
                 elif action == "clear": self.queue.clear_completed()
                 elif action == "back": self.screen = "lobby"; self.list_index = 0
+            
+        elif self.screen == "lobby_files":
+            files = self.client.room_files if self.client else []
+            if self.list_index < len(files):
+                 # Toggle selection? For now just download one
+                 f = files[self.list_index]
+                 self._download_files([f])
+            else:
+                 action_idx = self.list_index - len(files)
+                 action = self._get_lobby_file_actions()[action_idx][0]
+                 if action == "download_all": self._download_files(files)
+                 elif action == "back": self.screen = "lobby"; self.list_index = 0
+
+    def _do_join(self, ip: str, port: int, token: str):
+        if not self.client:
+            self.client = ShareClient(self.bus)
+        
+        success = self.client.join_room(ip, port, token, self.room_manager.device_name, self.room_manager.device_id)
+        if success:
+            self.screen = "lobby"
+            self.list_index = 0
+            self.last_msg = f"Joined room at {ip}:{port}"
+        else:
+            self.last_error = "Failed to join room. check IP/Token."
+
+    def _scan_rooms(self):
+        """Scan for available rooms and show results."""
+        self.screen = "scanning"
+        threading.Thread(target=self._do_scan, daemon=True).start()
+
+    def _do_scan(self):
+        self.discovered_rooms = self.discovery.scan_rooms(timeout=3.0)
+        self.screen = "scan_results"
+        self.list_index = 0
 
     def _execute_queue_transfer(self):
         """Start transferring all pending items in queue."""
@@ -221,18 +394,23 @@ class ShareTUI:
                         self.server.file_entries.append(fe)
         
         # 2. Coordinate with host
-        # For simplicity, we broadcast to all in room for now
-        targets = [d.device_id for d in self.room_manager.current_room.devices if "(you)" not in d.name]
         files_data = []
         for item in self.queue.queue:
             if item.status == "pending":
-                fe = FileEntry.from_path(str(item.file_path))
-                files_data.append({"file_id": fe.file_id, "name": fe.name, "size": fe.size_bytes})
+                # For folder units, we don't need a single FileEntry with full size, 
+                # but we need the correct folder name and is_dir flag.
+                files_data.append({
+                    "file_id": str(uuid.uuid4()) if item.is_dir else FileEntry.from_path(str(item.file_path)).file_id,
+                    "name": item.file_path.name,
+                    "size": item.file_size,
+                    "is_dir": item.is_dir,
+                    "targets": [item.target_device_id] if item.target_device_id != "ALL" else ["ALL"]
+                })
                 item.status = "transferring"
         
-        if targets and files_data:
-            self.client.queue_transfer(targets, files_data)
-            self.last_msg = "Transfer started for all queued files!"
+        if files_data:
+            self.client.queue_transfer(["SPECIAL_MULTIPER"], files_data) # Use a flag if server supports per-file targets
+            self.last_msg = f"Transfer started for {len(files_data)} items."
             self.screen = "lobby"; self.list_index = 0
         else:
             self.last_error = "No targets or files to send."
@@ -240,57 +418,148 @@ class ShareTUI:
     def _handle_back(self, event):
         if self.screen == "main":
              self.running = False
-             event.app.exit()
-        elif self.screen == "lobby":
+             get_app().exit()
+        elif self.screen in ("lobby", "scan_results"):
              self._leave_room()
         elif self.screen == "queue":
              self.screen = "lobby"; self.list_index = 0
         elif self.screen == "qr_join":
              self.screen = "main"; self.list_index = 0
+        elif self.screen in ("qr", "lobby_files"):
+             self.screen = "lobby"; self.list_index = 0
 
-    def _refresh_loop(self):
-        while self.running:
-            if self.screen == "lobby" and self.client:
-                # Poll host for updates
-                self.client.get_room_info() 
-            elif self.screen == "scanning":
-                # Discovery scan
-                pass
-            time.sleep(2)
+    def _copy_invite_link(self):
+        """Copy invitation URL to clipboard."""
+        if not self.room_manager.current_room:
+            return
+            
+        room = self.room_manager.current_room
+        url = f"http://{room.host_ip}:{room.port}/invite?t={room.token}"
+        
+        try:
+            import pyperclip
+            pyperclip.copy(url)
+            self._set_msg("Invite link COPIED to clipboard.")
+        except ImportError:
+            # Fallback: Just show it very clearly
+            self._set_msg(f"LINK: {url}")
+        except Exception as e:
+            self._set_error(f"Copy failed: {e}")
+
+    def _leave_room(self):
+        """Cleanup and return to main screen."""
+        if self.client:
+            try:
+                self.client.update_device_state("idle")
+                self.client.stop_heartbeat()
+            except: pass
+            self.client = None
+        if self.server:
+            # Shutdown server
+            try: self.server.stop()
+            except: pass
+            self.server = None
+            
+        self.room_manager.leave_room()
+        self.screen = "main"
+        self.list_index = 0
+        self.last_msg = "Left share room."
+        
+        # If we were started in direct room mode (dlm share room create), we should exit
+        if getattr(self, '_direct_mode', False):
+            raise KeyboardInterrupt 
+
+    def _download_files(self, files: List[dict]):
+        """Queue files for download."""
+        if not self.client or not files: return
+        for f in files:
+            # Add to local engine via bus
+            from dlm.app.commands import AddDownload
+            template = self.client._get_output_template(f['name'])
+            self.bus.handle(AddDownload(
+                url=f"{self.client.base_url}/download/{f['file_id']}?token={self.client.session_id}",
+                output_template=template,
+                title=f['name'],
+                source='share',
+                ephemeral=True
+            ))
+        self.last_msg = f"Started download of {len(files)} items."
+        self.screen = "lobby"; self.list_index = 0
+
 
     def _create_room(self):
         """Create a new room and start server."""
-        room = self.room_manager.create_room()
-        # Pass empty list initially, will add as files are queued for send
-        self.server = ShareServer(room=room, port=room.port, bus=self.bus, file_entries=[])
-        threading.Thread(target=self.server.run_server, daemon=True).start()
-        
-        # Wait for port
-        for _ in range(10):
-            if self.server.port: break
-            time.sleep(0.1)
+        self.screen = "creating"
+        self._set_msg("Creating room...")
+        threading.Thread(target=self._do_create_room, daemon=True).start()
+    
+    def _do_create_room(self):
+        """Background thread for room creation."""
+        try:
+            room = self.room_manager.create_room()
+            # Pass empty list initially, will add as files are queued for send
+            self.server = ShareServer(room=room, port=room.port, bus=self.bus, file_entries=[])
+            threading.Thread(target=self.server.run_server, daemon=True).start()
             
-        self.client = ShareClient(self.bus)
-        self.client.join_room(room.host_ip, self.server.port, room.token, self.room_manager.device_name)
-        self.discovery.advertise_room(room.room_id, room.token, self.server.port, self.room_manager.device_id)
-        
-        self.screen = "lobby"
-        self.list_index = len(room.devices)
+            # Wait for port (non-blocking for TUI)
+            for _ in range(20):  # 2 seconds max
+                if self.server.port: 
+                    break
+                time.sleep(0.1)
+            
+            if not self.server.port:
+                self._set_error("Failed to start server")
+                self.screen = "main"
+                return
+                
+            self.client = ShareClient(self.bus)
+            success = self.client.join_room(
+                room.host_ip, 
+                self.server.port, 
+                room.token, 
+                self.room_manager.device_name, 
+                self.room_manager.device_id
+            )
+            
+            if not success:
+                self._set_error("Failed to join own room")
+                self.screen = "main"
+                return
+            
+            # Advertise room
+            adv_success = self.discovery.advertise_room(
+                room.room_id, 
+                room.token, 
+                self.server.port, 
+                self.room_manager.device_id
+            )
+            
+            if not adv_success:
+                self._set_msg("Room created (LAN discovery unavailable)")
+            else:
+                self._set_msg(f"Room {room.room_id} created successfully")
+            
+            self.screen = "lobby"
+            self.list_index = 0
+            
+            try:
+                get_app().invalidate()
+            except:
+                pass
+                
+        except Exception as e:
+            self._set_error(f"Room creation failed: {e}")
+            self.screen = "main"
+            try:
+                get_app().invalidate()
+            except:
+                pass
 
-    def _add_files(self):
-        """Invoke ranger file picker."""
-        def on_add(path: Path) -> int:
-            count = self.queue.add_path(path)
-            self.last_msg = f"✔ Added to queue: {path.name} ({count} items)"
-            return count
-        launch_picker(on_add)
 
     def _show_qr(self):
-        """Placeholder for showing QR within TUI."""
-        # For now, we set a temporary message or a dedicated screen
-        room = self.room_manager.current_room
-        self.last_msg = f"QR Info: {room.room_id} | {room.token} | {room.host_ip}"
-        # generate_room_qr could be displayed in a full-screen mode later
+        """Show the QR code screen."""
+        self.screen = "qr"
+        self.list_index = 0
 
     # --- Rendering ---
 
@@ -298,101 +567,165 @@ class ShareTUI:
         if self.screen == "main": return self._render_main()
         elif self.screen == "lobby": return self._render_lobby()
         elif self.screen == "queue": return self._render_queue()
+        elif self.screen == "qr": return self._render_qr()
+        elif self.screen == "creating": return HTML(" <header>Creating Room...</header>\n\n Please wait while the server starts...")
         elif self.screen == "scanning": return HTML(" <header>Scanning for rooms...</header>\n\n Please wait (3s)...")
         elif self.screen == "scan_results": return self._render_scan_results()
         elif self.screen == "manual_join": return self._render_manual_join()
-        elif self.screen == "qr_join": return HTML(" <header>Join via QR</header>\n\n [Coming soon: Paste QR URI here]")
+        elif self.screen == "lobby_files": return self._render_lobby_files()
+        elif self.screen == "qr_join": return HTML(" <header>Join via URL</header>\n\n [Please paste the HTTP invite link here]")
         return HTML("Loading...")
 
+    def _render_qr(self):
+        room = self.room_manager.current_room
+        if not room: return HTML("ERROR: NO ROOM")
+        qr_art = generate_room_qr(room.room_id, room.host_ip, room.port, room.token)
+        return HTML(f" <header>ROOM QR CODE (Lobby Invite)</header>\n\n{qr_art}\n\n <i>Press 'q' or 'esc' to go back.</i>")
+
+    def _render_lobby_files(self):
+        all_files = self.client.room_files if self.client else []
+        # Filter out self-owned files
+        files = [f for f in all_files if f.get('owner_id') != self.room_manager.device_id]
+        
+        lines = ["<header>DOWNLOAD FROM OTHERS</header>", ""]
+        if not files:
+            lines.append(" <i>No files from other devices available.</i>")
+            if len(all_files) > len(files):
+                lines.append(f" (Hiding {len(all_files) - len(files)} self-owned items)")
+        else:
+            for i, f in enumerate(files):
+                style = "selected" if i == self.list_index else "default"
+                size = f.get('size_bytes', 0) / 1024 / 1024
+                dir_mark = "[DIR] " if f.get('is_dir') else ""
+                lines.append(f" <{style}>{'>' if i == self.list_index else ' '} {dir_mark}{f['name'][:35]:<35} {size:>6.1f}MB</{style}>")
+        
+        lines.append("")
+        actions = self._get_lobby_file_actions()
+        for i, (act, label) in enumerate(actions):
+            idx = i + len(files)
+            style = "selected" if idx == self.list_index else "header"
+            lines.append(f" <{style}>{'>' if idx == self.list_index else ' '} {label}</{style}>")
+            
+        return HTML("\n".join(lines))
+
     def _render_scan_results(self):
-        lines = [HTML("<header>Discovered Rooms</header>"), ""]
+        lines = ["<header>Discovered Rooms</header>", ""]
         if not self.discovered_rooms:
-            lines.append(HTML(" No rooms found. Press 'q' to go back."))
+            lines.append(" No rooms found. Press 'q' to go back.")
         else:
             for i, r in enumerate(self.discovered_rooms):
                 style = "selected" if i == self.list_index else "default"
-                lines.append(HTML(f" <{style}>{'>' if i == self.list_index else ' '} {r['room_id']} - {r['hostname']} ({r['ip']})</{style}>"))
+                lines.append(f" <{style}>{'>' if i == self.list_index else ' '} {r['room_id']} - {r['hostname']} ({r['ip']})</{style}>")
         return HTML("\n".join(lines))
 
     def _render_manual_join(self):
         return HTML(" <header>Manual Join</header>\n\n Enter <b>IP:PORT TOKEN</b> (e.g. 192.168.1.5:8080 ABC-XYZ)\n Press <b>ENTER</b> to join, <b>ESC</b> to cancel.")
 
     def _render_qr_join(self):
-        return HTML(" <header>Join via QR</header>\n\n Paste <b>dlm://share...</b> URI here\n Press <b>ENTER</b> to confirm, <b>ESC</b> to cancel.")
+        return HTML(" <header>Invite Join</header>\n\n Paste <b>http://.../invite</b> link here\n Press <b>ENTER</b> to confirm, <b>ESC</b> to cancel.")
 
     def _render_main(self):
-        lines = [HTML("<header>      DLM SHARE (Phase 2)</header>"), ""]
+        lines = ["<header>      DLM SHARE (Phase 2)</header>", ""]
         items = self._get_main_menu_items()
         for i, (act, label) in enumerate(items):
             style = "selected" if i == self.list_index else "default"
-            lines.append(HTML(f" <{style}>{'>' if i == self.list_index else ' '} {label}</{style}>"))
-        if self.last_error: lines.append(HTML(f"\n <error>! {self.last_error}</error>"))
+            lines.append(f" <{style}>{'>' if i == self.list_index else ' '} {label}</{style}>")
+        if self.last_error: lines.append(f"\n <error>! {self.last_error}</error>")
         return HTML("\n".join(lines))
 
     def _render_lobby(self):
         room = self.room_manager.current_room
         if not room: return HTML("Error: Room lost")
         
+        file_count = self._get_files_count()
+        queue_count = len([f for f in self.queue.queue if f.status == "pending"])
+        
+        # --- HEADER / STATUS (Display Only) ---
         lines = [
-            HTML(f" <header>ROOM:</header> <room-id>{room.room_id}</room-id>  |  TOKEN: <msg>{room.token}</msg>"),
-            HTML(f" HOST: {room.host_ip}:{room.port}"),
-            ""
+            f" <header>DLM SHARE ROOM</header>  ID: <room-id>{room.room_id}</room-id>  |  TOKEN: <msg>{room.token}</msg>",
+            f" <header>Invite:</header> <msg>http://{room.host_ip}:{room.port}/invite?t={room.token}</msg>",
+            f" Status: <msg>Lobby Active</msg>  |  Shared: <msg>{file_count}</msg>  |  Queue: <msg>{queue_count}</msg>",
+            " " + "─"*60
         ]
         
         # Display Devices
         devices = room.devices
-        for i, d in enumerate(devices):
-            style = "selected" if i == self.list_index else ("device-you" if "(you)" in d.name else "device-idle")
-            active_mark = "●" if d.is_active() else "○"
-            lines.append(HTML(f" <{style}>{active_mark} {d.name[:20]:<20} {d.state:<10} {d.ip}</{style}>"))
-            if d.current_transfer:
-                t = d.current_transfer
-                lines.append(HTML(f"    <msg>└ Sending: {t['name'][:30]} ({t['progress']:.1f}%)</msg>"))
+        lines.append(" <header>Connected Devices:</header>")
+        if not devices:
+            lines.append("  <i>No devices connected</i>")
+        else:
+            for d in devices:
+                # Devices are NOT selectable, so just show them
+                is_you = "(you)" in d.name
+                style = "device-you" if is_you else ("device-active" if d.is_active() else "device-idle")
+                active_mark = "●" if d.is_active() else "○"
+                status_txt = f"[{d.state}]"
+                lines.append(f"  <{style}>{active_mark} {d.name[:18]:<18} {status_txt:<12} {d.ip}</{style}>")
+                
+                if d.current_transfer:
+                    t = d.current_transfer
+                    prog = t.get('progress', 0)
+                    name = t.get('name', 'file')
+                    lines.append(f"      <msg>└ Sending: {name[:25]} ({prog:.1f}%)</msg>")
 
-        lines.append("")
+        lines.append(" " + "─"*50)
         
-        # Actions
+        # --- ACTION MENU (Selectable) ---
+        lines.append(" <header>Actions:</header>")
+        
         actions = self._get_lobby_actions()
         for i, (act, label) in enumerate(actions):
-            idx = i + len(devices)
-            style = "selected" if idx == self.list_index else "header"
-            lines.append(HTML(f" <{style}>{'>' if idx == self.list_index else ' '} {label}</{style}>"))
+            # i matches simple list index
+            is_selected = (i == self.list_index)
+            prefix = " > " if is_selected else "   "
+            style = "selected" if is_selected else "header" if act in ("refresh", "leave") else "default"
+            lines.append(f" <{style}>{prefix}{label}</{style}>")
             
         if self.last_msg:
-             lines.append(HTML(f"\n <msg>{self.last_msg}</msg>"))
+             lines.append(f"\n <msg>{self.last_msg}</msg>")
+        if self.last_error:
+             lines.append(f"\n <error>{self.last_error}</error>")
              
         return HTML("\n".join(lines))
 
     def _render_queue(self):
-        lines = [HTML("<header>TRANSFER QUEUE</header>"), ""]
+        lines = ["<header>TRANSFER QUEUE</header>", ""]
         if not self.queue:
-            lines.append(HTML(" <i>Queue is empty. Use lobby to add files.</i>"))
+            lines.append(" <i>Queue is empty. Use lobby to add files.</i>")
         else:
             for i, item in enumerate(self.queue.queue):
                 style = "selected" if i == self.list_index else "default"
                 status_color = "00ff00" if item.status == "completed" else ("ffaa00" if item.status == "transferring" else "ffffff")
-                lines.append(HTML(f" <{style}>{i+1}. {item.file_name[:40]:<40} {item.file_size/1024/1024:>6.1f}MB  <text fg='#{status_color}'>{item.status}</text></{style}>"))
+                target_name = item.target_device_id
+                if target_name != "ALL":
+                    room = self.room_manager.current_room
+                    if room:
+                        dev = next((d for d in room.devices if d.device_id == target_name), None)
+                        if dev: target_name = dev.name[:8]
+                
+                dir_mark = "[DIR] " if item.is_dir else ""
+                lines.append(f" <{style}>{i+1}. {dir_mark}{item.file_name[:25]:<25} {item.file_size/1024/1024:>6.1f}MB  -> <msg>{target_name:<8}</msg> <text fg='#{status_color}'>{item.status}</text></{style}>")
         
         lines.append("")
         for i, (act, label) in enumerate(self._get_queue_actions()):
             idx = i + len(self.queue)
             style = "selected" if idx == self.list_index else "header"
-            lines.append(HTML(f" <{style}>{'>' if idx == self.list_index else ' '} {label}</{style}>"))
+            lines.append(f" <{style}>{'>' if idx == self.list_index else ' '} {label}</{style}>")
             
         return HTML("\n".join(lines))
 
     def run(self):
         self.refresh_thread.start()
         
-        body = Window(content=FormattedTextControl(self._get_content), height=Dimension(min=10))
-        input_window = Window(content=self.input_field.control, height=1, style='class:input-field',
-                             get_height=lambda: 1 if self.screen in ("manual_join", "qr_join") else 0)
+        # Fixed layout: Use ConditionalContainer so the TextArea widget itself is in the layout tree
+        input_area = ConditionalContainer(
+            content=self.input_field,
+            filter=Condition(lambda: self.screen in ("manual_join", "qr_join"))
+        )
         
         layout = Layout(
             HSplit([
-                body,
-                input_window,
-                Window(content=FormattedTextControl(HTML("\n <footer>Arrows: Navigate | Enter: Select | q: Back/Exit</footer>")), height=2)
+                self.body_window
             ])
         )
         
@@ -401,19 +734,31 @@ class ShareTUI:
             key_bindings=self.kb,
             style=self.style,
             full_screen=True,
-            refresh_interval=0.5
+            refresh_interval=0.5,
+            mouse_support=False,  # Disable mouse to prevent cursor issues
+            erase_when_done=True  # Clean terminal on exit
         )
         
         app.run()
 
 
 def run_share_tui(bus):
-    """Run share TUI."""
+    """Run share TUI with error reporting."""
     from dlm.share.room_manager import RoomManager
     
-    # Get or create room manager
-    if not hasattr(run_share_tui, '_room_manager'):
-        run_share_tui._room_manager = RoomManager()
-    
-    tui = ShareTUI(run_share_tui._room_manager, bus)
-    tui.run()
+    try:
+        # Get or create room manager
+        if not hasattr(run_share_tui, '_room_manager'):
+            run_share_tui._room_manager = RoomManager()
+        
+        tui = ShareTUI(run_share_tui._room_manager, bus)
+        tui.run()
+    except Exception as e:
+        import traceback
+        print(f"\n❌ \033[1;31mSHARE TUI CRASHED\033[0m")
+        print(f"Error: {e}")
+        # Write to a log file for diagnosis
+        with open("dlm_share_error.log", "w") as f:
+            f.write(traceback.format_exc())
+        print("Detailed error saved to dlm_share_error.log")
+        time.sleep(3)

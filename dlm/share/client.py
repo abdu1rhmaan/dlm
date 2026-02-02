@@ -18,6 +18,7 @@ class ShareClient:
         self.room_id = None
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._stop_heartbeat = threading.Event()
+        self.room_files = []
 
     def _get_output_template(self, filename: str, overrides: str = None) -> str:
         """
@@ -141,7 +142,7 @@ class ShareClient:
             print(f"❌ Unexpected error: {e}")
     
     # Phase 2: Room methods
-    def join_room(self, ip: str, port: int, token: str, device_name: str) -> bool:
+    def join_room(self, ip: str, port: int, token: str, device_name: str, device_id: str = None) -> bool:
         """
         Join a room and register as a device.
         
@@ -150,6 +151,7 @@ class ShareClient:
             port: Room port
             token: Room token
             device_name: This device's name
+            device_id: This device's unique ID
         
         Returns:
             True if joined successfully, False otherwise
@@ -174,7 +176,8 @@ class ShareClient:
                 f"{self.base_url}/room/join",
                 json={
                     "device_name": device_name,
-                    "device_ip": self._get_local_ip()
+                    "device_ip": self._get_local_ip(),
+                    "device_id": device_id
                 },
                 headers={"Authorization": f"Bearer {self.session_id}"},
                 timeout=5
@@ -209,7 +212,10 @@ class ShareClient:
             )
             
             if response.status_code == 200:
-                return response.json()
+                data = response.json()
+                if "files" in data:
+                    self.room_files = data["files"]
+                return data
             
             return None
         except Exception:
@@ -324,28 +330,50 @@ class ShareClient:
 
     def _handle_incoming_transfer(self, transfer: dict) -> Optional[str]:
         """Process an incoming transfer request. Returns the DL ID if started."""
-        target_file = {
-            "file_id": transfer["file_id"],
-            "name": transfer["name"],
-            "size_bytes": transfer["size"]
-        }
-        
-        # Determine URL
+        is_dir = transfer.get("is_dir", False)
         sender_url = f"http://{transfer['sender_ip']}:{transfer['sender_port']}"
-        download_url = f"{sender_url}/download/{target_file['file_id']}"
-        final_url = f"{download_url}?token={self.session_id}"
+        
+        if not is_dir:
+            return self._start_single_download(
+                transfer["file_id"], 
+                transfer["name"], 
+                transfer["size"], 
+                sender_url
+            )
+        else:
+            # Handle Folder Unit
+            return self._start_folder_download(
+                transfer["file_id"],
+                transfer["name"],
+                sender_url
+            )
+
+    def _start_single_download(self, file_id: str, name: str, size: int, sender_url: str, sub_path: str = None) -> Optional[str]:
+        download_url = f"{sender_url}/download/{file_id}"
+        if sub_path:
+            download_url += f"/sub?rel_path={sub_path}"
+        
+        final_url = f"{download_url}{'&' if '?' in download_url else '?'}token={self.session_id}"
         
         # Determine Output Path
-        output_template = self._get_output_template(target_file['name'])
+        raw_template = self._get_output_template(name)
+        
+        if sub_path:
+             # Folder Unit: Create structure .../Category/FolderName/SubDirs/
+             # 'name' is the folder name in this context
+             extra_path = Path(sub_path).parent
+             output_template = str(Path(raw_template) / name / extra_path)
+        else:
+             output_template = raw_template
         
         from dlm.app.commands import AddDownload, StartDownload
         
         dl_id = self.bus.handle(AddDownload(
             url=final_url,
             output_template=output_template,
-            title=target_file['name'],
+            title=name if not sub_path else f"{name}/{sub_path}",
             source='share',
-            total_size=target_file['size_bytes'],
+            total_size=size,
             ephemeral=True
         ))
         
@@ -354,6 +382,31 @@ class ShareClient:
             self.update_device_state("receiving")
             return dl_id
         return None
+
+    def _start_folder_download(self, folder_id: str, folder_name: str, sender_url: str) -> Optional[str]:
+        """Fetch folder items and initiate downloads."""
+        try:
+            response = requests.get(
+                f"{sender_url}/folder/{folder_id}",
+                headers={"Authorization": f"Bearer {self.session_id}"},
+                timeout=5
+            )
+            if response.status_code != 200:
+                return None
+            
+            items = response.json()
+            first_dl_id = None
+            for item in items:
+                # We prefix the relative path with the folder name to recreate structure
+                rel_path = item["rel_path"]
+                full_rel_path = os.path.join(folder_name, rel_path)
+                dl_id = self._start_single_download(folder_id, folder_name, item["size"], sender_url, sub_path=rel_path)
+                if not first_dl_id:
+                    first_dl_id = dl_id
+            
+            return first_dl_id # Return first ID to track activity
+        except Exception:
+            return None
     
     def stop_heartbeat(self):
         """Stop heartbeat thread."""
@@ -362,13 +415,47 @@ class ShareClient:
             self._heartbeat_thread.join(timeout=2)
     
     def _get_local_ip(self) -> str:
-        """Get local IP address."""
-        import socket
+        """Get the actual LAN IP address, filtering virtual adapters."""
         try:
+            import psutil
+            BLACKLIST = ['vbox', 'docker', 'virtual', 'wsl', 'tailscale', 'zerotier', 'vpn', 'vmnet']
+            candidates = []
+            
+            for interface, addrs in psutil.net_if_addrs().items():
+                if any(b in interface.lower() for b in BLACKLIST):
+                    continue
+                for addr in addrs:
+                    if addr.family == 2:  # AF_INET
+                        ip = addr.address
+                        if ip.startswith('127.'): continue
+                        
+                        score = 70
+                        if ip.startswith('192.168.1.') or ip.startswith('192.168.0.'): score = 100
+                        elif ip.startswith('192.168.56.'): score = 10  # Deprioritize VBox
+                        elif ip.startswith('192.168.'): score = 95
+                        elif ip.startswith('10.'): score = 90
+                        elif ip.startswith('172.'):
+                            try:
+                                second = int(ip.split('.')[1])
+                                if 16 <= second <= 31: score = 80
+                            except: pass
+                        candidates.append((score, ip))
+            
+            if candidates:
+                candidates.sort(reverse=True)
+                return candidates[0][1]
+        except:
+            pass
+
+        # Fallback to socket trick
+        try:
+            import socket
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
             ip = s.getsockname()[0]
             s.close()
             return ip
-        except Exception:
-            return "127.0.0.1"
+        except:
+            pass
+        
+        return "127.0.0.1"

@@ -39,6 +39,8 @@ class Room:
     token: str
     host_ip: str
     port: int
+    host_device_name: str = "Host"
+    host_device_id: str = "HOST"
     devices: List[Device] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)
     ttl: int = 3600  # 1 hour default
@@ -89,3 +91,7 @@ class Room:
         if device:
             device.state = state
             device.update_heartbeat()
+
+    def prune_stale_devices(self, timeout_seconds: int = 60):
+        """Remove devices not seen for a while."""
+        self.devices = [d for d in self.devices if d.is_active(timeout_seconds)]

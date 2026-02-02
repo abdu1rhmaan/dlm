@@ -45,12 +45,8 @@ except ImportError as e:
         lt = None
 
     if lt is None:
-        msg = f"Warning: Failed to import libtorrent: {e}. "
-        if is_termux:
-            msg += "On Termux, please install it via: pkg install python-libtorrent"
-        else:
-            msg += "Torrent features will be disabled. Install via: pip install dlm[torrent]"
-        print(msg)
+        # Silent - libtorrent is optional, error shown only when user tries to use it
+        pass
 
 class TorrentClient:
     """

@@ -16,8 +16,8 @@ def generate_room_qr(room_id: str, ip: str, port: int, token: str) -> str:
     try:
         import qrcode
         
-        # Encode room info as custom URI
-        data = f"dlm://share?room={room_id}&ip={ip}&port={port}&token={token}"
+        # Encode the HTTP Invite URL as the primary payload
+        data = f"http://{ip}:{port}/invite?t={token}"
         
         qr = qrcode.QRCode(
             version=1,
@@ -28,28 +28,34 @@ def generate_room_qr(room_id: str, ip: str, port: int, token: str) -> str:
         qr.add_data(data)
         qr.make(fit=True)
         
-        # Generate ASCII art using block characters
+        # Generate ASCII art using half-block characters (compact version)
         output = []
         matrix = qr.get_matrix()
         
         # Add top border
-        output.append("┌" + "─" * (len(matrix[0]) * 2) + "┐")
+        width = len(matrix[0])
+        output.append("┌" + "─" * width + "┐")
         
-        # Add QR code rows
-        for row in matrix:
-            line = '│' + ''.join('██' if cell else '  ' for cell in row) + '│'
+        # Iterate two rows at a time
+        for r in range(0, len(matrix), 2):
+            line = "│"
+            for c in range(width):
+                top = matrix[r][c]
+                bottom = matrix[r+1][c] if r+1 < len(matrix) else False
+                
+                if top and bottom: line += "█"
+                elif top: line += "▀"
+                elif bottom: line += "▄"
+                else: line += " "
+            line += "│"
             output.append(line)
         
         # Add bottom border
-        output.append("└" + "─" * (len(matrix[0]) * 2) + "┘")
+        output.append("└" + "─" * width + "┘")
         
-        # Add room info below QR
-        output.append("")
-        output.append(f"  Room: {room_id}")
-        output.append(f"  Token: {token}")
-        output.append(f"  IP: {ip}:{port}")
-        
-        return '\n'.join(output)
+        # Unified link display
+        footer = f"\n Join: http://{ip}:{port}/invite?t={token}"
+        return '\n'.join(output) + footer
     
     except ImportError:
         return """
@@ -66,6 +72,7 @@ Room Information:
   Room: {room_id}
   Token: {token}
   IP: {ip}:{port}
+  Invite: http://{ip}:{port}/invite?t={token}
 """.format(room_id=room_id, token=token, ip=ip, port=port)
     
     except Exception as e:
@@ -77,6 +84,7 @@ Room Information:
   Room: {room_id}
   Token: {token}
   IP: {ip}:{port}
+  Invite: http://{ip}:{port}/invite?t={token}
 """
 
 
@@ -85,7 +93,7 @@ def parse_qr_data(data: str) -> dict:
     Parse QR code data back into room information.
     
     Args:
-        data: QR code data string (dlm://share?...)
+        data: QR code data string (dlm://share?...) or Invite URL
     
     Returns:
         Dictionary with room_id, ip, port, token
@@ -93,8 +101,19 @@ def parse_qr_data(data: str) -> dict:
     try:
         from urllib.parse import urlparse, parse_qs
         
-        if not data.startswith('dlm://share'):
-            raise ValueError("Invalid QR code format")
+        if data.startswith('http'):
+            # Allow parsing the invite URL if pasted directly
+            parsed = urlparse(data)
+            params = parse_qs(parsed.query)
+            return {
+                'ip': parsed.hostname,
+                'port': parsed.port,
+                'room_id': '?',
+                'token': params.get('t', ['?'])[0]
+            }
+
+        if not data.startswith('dlm://'):
+            raise ValueError("Invalid URI format")
         
         parsed = urlparse(data)
         params = parse_qs(parsed.query)

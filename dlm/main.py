@@ -53,6 +53,7 @@ def main():
 
     subparsers.add_parser("browser", help="Start browser for download capture")
     subparsers.add_parser("setup", help="Automated environment setup (Termux dependencies)")
+    subparsers.add_parser("launcher", help="Open DLM Feature Manager (TUI)")
 
     # Share Command (Phase 1)
     share_parser = subparsers.add_parser("share", help="Share files on LAN")
@@ -66,6 +67,11 @@ def main():
     receive_parser.add_argument("port", nargs='?', type=int, help="Sender port")
     receive_parser.add_argument("token", nargs='?', help="Authentication token")
     receive_parser.add_argument("-save-to", "--save-to", help="Destination folder override", default=None)
+
+    join_parser = share_subparsers.add_parser("join", help="Automated join (for scripts)")
+    join_parser.add_argument("--ip", help="Sender IP")
+    join_parser.add_argument("--port", type=int, help="Sender port")
+    join_parser.add_argument("--token", help="Authentication token")
 
     args = parser.parse_args()
 
@@ -168,7 +174,28 @@ def main():
             except Exception as e:
                 print(f"❌ Pip installation failed: {e}")
 
+        elif args.command == "launcher":
+            try:
+                from dlm.features.tui import run_feature_manager
+                run_feature_manager()
+            except Exception as e:
+                print(f"Error launching feature manager: {e}")
+
         elif args.command == "share":
+            # Check if share dependencies are installed
+            try:
+                import fastapi
+                import uvicorn
+            except ImportError as e:
+                missing = str(e).split("'")[1] if "'" in str(e) else "required dependencies"
+                print(f"\n❌ Error: {missing} is not installed.")
+                print("📦 To use 'dlm share', install dependencies via Feature Manager:")
+                print("   dlm launcher")
+                print("   Then select 'Share' feature and install.")
+                print("\nOr install manually:")
+                print("   pip install fastapi uvicorn zeroconf qrcode psutil")
+                return
+            
             from dlm.share.cli import handle_share_command
             handle_share_command(args, bus)
 

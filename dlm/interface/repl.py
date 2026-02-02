@@ -436,12 +436,14 @@ class DLMShell(cmd.Cmd):
         pass
 
     def cmdloop(self, intro=None):
-        """Override cmdloop to handle Ctrl+C gracefully."""
+        """Override cmdloop to handle Ctrl+C as a hard exit."""
         try:
             super().cmdloop(intro)
         except KeyboardInterrupt:
             print("\nBye!")
-            return
+            # Use sys.exit to ensure we break out of any parent loops in main.py
+            import sys
+            sys.exit(0)
 
     def do_retry(self, arg):
         """Retry a failed or cancelled download: retry <index_selector> (e.g., retry 1, retry 1..5)"""
@@ -683,91 +685,71 @@ class DLMShell(cmd.Cmd):
         print(".")
         self._print_tree_recursive(self.current_folder_id, "", brw)
 
+    def do_launcher(self, arg):
+        """
+        Open the DLM Feature Manager (Launcher).
+        Manage modules like YouTube, Browser, etc.
+        """
+        try:
+            from dlm.features.tui import run_feature_manager
+            run_feature_manager()
+        except Exception as e:
+            print(f"Error launching feature manager: {e}")
+            
     def do_share(self, arg):
         """
         Share files on LAN.
         Usage: 
           share                     -> Open Interactive TUI (Scan/Create Room)
-          share send [file-path]    -> Quick send (Phase 1 legacy)
-          share receive [ip] [port] [token] -> Quick receive (Phase 1 legacy)
+          share send [path]         -> Direct send file/folder
+          share receive             -> Wait for incoming files (join room)
+          share join [ip:port] [tk] -> Join specific room
+          share room create         -> Start a room directly
         """
         import shlex
-        parts = shlex.split(arg)
-            
-        # Parse action and arguments
-        action = None
-        file_path = None
-        ip = None
-        port = None
-        token = None
-        save_to = None
-        
-        # Determine action (send/receive)
-        if parts:
-            if parts[0] in ['send', '-send']:
-                action = 'send'
-                # Check for file path argument
-                if len(parts) > 1 and not parts[1].startswith('-'):
-                    file_path = parts[1]
-            elif parts[0] in ['receive', 'rec', '-rec', '-receive']:
-                action = 'receive'
-                # Check for ip, port, token arguments
-                remaining = parts[1:]
-                non_flag_args = [p for p in remaining if not p.startswith('-')]
-                if len(non_flag_args) >= 1:
-                    ip = non_flag_args[0]
-                if len(non_flag_args) >= 2:
-                    try:
-                        port = int(non_flag_args[1])
-                    except ValueError:
-                        print("Error: Port must be a number")
-                        return
-                if len(non_flag_args) >= 3:
-                    token = non_flag_args[2]
-
-        # Parse -save-to flag
-        if '-save-to' in parts:
-            try:
-                idx = parts.index('-save-to')
-                if idx + 1 < len(parts):
-                    save_to = parts[idx+1]
-            except:
-                pass
-
-        # Create args object
-        class MockArgs:
-            def __init__(self):
-                self.share_action = action
-                self.file_path = file_path
-                self.ip = ip
-                self.port = port
-                self.token = token
-                self.save_to = save_to
-
-        # Parse -save-to flag
-        if '-save-to' in parts:
-            try:
-                idx = parts.index('-save-to')
-                if idx + 1 < len(parts):
-                    save_to = parts[idx+1]
-            except:
-                pass
-
-        # Create args object
-        class MockArgs:
-            def __init__(self):
-                self.share_action = action
-                self.file_path = file_path
-                self.ip = ip
-                self.port = port
-                self.token = token
-                self.save_to = save_to
-
         from dlm.share.cli import handle_share_command
+        
+        # Mock args to mimic argparse
+        class MockArgs:
+            def __init__(self, action=None, path=None, ip=None, port=None, token=None, save_to=None):
+                self.share_action = action
+                self.file_path = path
+                self.ip = ip
+                self.port = port
+                self.token = token
+                self.save_to = save_to
+                self.room_action = None
+
+        parts = shlex.split(arg)
+        action = parts[0] if parts else None
+        args = MockArgs(action=action)
+        
+        if action == 'send' and len(parts) > 1:
+            args.file_path = parts[1]
+        elif action in ('receive', 'join'):
+            if len(parts) > 1:
+                addr = parts[1]
+                if ':' in addr:
+                    args.ip, p_str = addr.split(':')
+                    try: args.port = int(p_str)
+                    except: pass
+                else: args.ip = addr
+            if len(parts) > 2:
+                args.token = parts[2]
+        elif action == 'room' and len(parts) > 1:
+            args.room_action = parts[1]
+
+        if '-save-to' in parts:
+            try:
+                idx = parts.index('-save-to')
+                if idx + 1 < len(parts):
+                    args.save_to = parts[idx+1]
+            except: pass
+
         try:
-             handle_share_command(MockArgs(), self.bus)
+            handle_share_command(args, self.bus)
         except Exception as e:
-             print(f"Error: {e}")
+            print(f"Error executing share command: {e}")
 
     def _get_uuid_by_index(self, index_arg):
         try:
@@ -1157,20 +1139,39 @@ class DLMShell(cmd.Cmd):
                 self.bus.handle(AddDownload(url=url, referer=flag_referer, folder_id=self.current_folder_id))
                 print("Queued (RAW).")
                 return
+        except NotImplementedError as e:
+            # Clear Analyzing line
+            print("\r" + " " * 20 + "\r", end='', flush=True)
+            # Clean error message for missing dependencies
+            error_msg = str(e)
+            if "yt-dlp" in error_msg or "yt_dlp" in error_msg:
+                print("❌ Error: yt-dlp is not installed.")
+                print("📦 Install it via Feature Manager:")
+                print("   dlm launcher → Select 'Social' feature")
+                print("\nOr manually: pip install yt-dlp")
+            else:
+                print(f"❌ Error: {error_msg}")
+            return
+        except Exception as e:
+            # Clear Analyzing line
+            print("\r" + " " * 20 + "\r", end='', flush=True)
+            # For other errors, show a brief message
+            print(f"❌ Error analyzing URL: {str(e)}")
+            return
 
-            # 4. Collection / Torrent Handling
-            if extract_result.platform == 'torrent':
-                # Torrent Special Handling
-                metadata = extract_result.metadata
-                
-                # If magnet, we might need a resolution step here if not done in extractor
-                if not metadata or not metadata.files:
-                    print(f"[TORRENT] Resolving metadata for: {metadata.title if metadata else url}...")
-                    # In a real implementation, this would call a method to resolve magnet metadata
-                    # via DHT. For now, we'll assume it's resolved or show failure.
-                    if not metadata:
-                        print("Error: Could not resolve torrent metadata.")
-                        return
+        # 4. Collection / Torrent Handling
+        if extract_result.platform == 'torrent':
+            # Torrent Special Handling
+            metadata = extract_result.metadata
+            
+            # If magnet, we might need a resolution step here if not done in extractor
+            if not metadata or not metadata.files:
+                print(f"[TORRENT] Resolving metadata for: {metadata.title if metadata else url}...")
+                # In a real implementation, this would call a method to resolve magnet metadata
+                # via DHT. For now, we'll assume it's resolved or show failure.
+                if not metadata:
+                    print("Error: Could not resolve torrent metadata.")
+                    return
                 
                 print(f"\n[TORRENT DISCOVERY]")
                 print(f"Name: {metadata.title}")
@@ -1502,11 +1503,6 @@ class DLMShell(cmd.Cmd):
                 flag_cut = ic['cut']
                     
                 self._handle_media_add(extract_result, flag_audio, flag_video, flag_quality, flag_cut, flag_vocals, flag_vocals_gpu, flag_vocals_all, flag_output, flag_rename, referer=flag_referer)
-
-        except Exception as e:
-            print(f"Error: {e}")
-            import traceback
-            traceback.print_exc()
 
     def _handle_media_add(self, res, audio=False, video=False, quality=None, cut=None, vocals=False, vocals_gpu=False, vocals_all=False, output=None, rename=None, referer=None):
         """Handle single item addition."""
@@ -2944,7 +2940,7 @@ class DLMShell(cmd.Cmd):
             queue = self.service.get_vocals_queue()
             failed = [t for t in queue if t['status'] == 'failed']
             
-            print("\nMonitor exited. Background processing continues.")
+            print("\nMonitor exited. (Press Ctrl+C again to exit DLM)")
             
             if failed:
                 print("\n" + "="*60)

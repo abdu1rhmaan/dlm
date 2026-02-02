@@ -16,7 +16,7 @@ class MediaService:
         # Placeholder for dependencies (e.g. registry)
         from dlm.extractors.youtube.extractor import YouTubeExtractor
         from dlm.extractors.tiktok.extractor import TikTokExtractor
-        # from dlm.extractors.facebook.extractor import FacebookExtractor
+        from dlm.extractors.facebook.extractor import FacebookExtractor
         from dlm.extractors.spotify.extractor import SpotifyExtractor
         from dlm.extractors.torrent.extractor import TorrentExtractor
 
@@ -26,7 +26,7 @@ class MediaService:
             TikTokExtractor(),
             SpotifyExtractor(config_repo=config_repo),
             TorrentExtractor(),
-            # FacebookExtractor(),
+            FacebookExtractor(),
         ]
 
     def extract_info(self, url: str, limit: int = None):

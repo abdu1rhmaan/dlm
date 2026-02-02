@@ -23,39 +23,54 @@ class RoomDiscovery:
         self._lock = threading.Lock()
     
     def _get_local_ip(self) -> str:
-        """Get local IP address."""
+        """Get best local LAN IP."""
+        excluded_subnets = ["192.168.56."] # VirtualBox
+        excluded_ifaces = ["docker", "vbox", "vmware", "wsl", "v-ethernet", "virbr"]
+        
+        candidates = []
         try:
             import psutil
-            for interface, addrs in psutil.net_if_addrs().items():
+            for iface, addrs in psutil.net_if_addrs().items():
+                # Filter by interface name
+                if any(x in iface.lower() for x in excluded_ifaces):
+                    continue
+                    
                 for addr in addrs:
-                    if addr.family == 2:  # AF_INET (IPv4)
+                    if addr.family == 2:  # AF_INET
                         ip = addr.address
-                        if ip.startswith('192.168.') or ip.startswith('10.'):
-                            return ip
-                        elif ip.startswith('172.'):
-                            try:
-                                second_octet = int(ip.split('.')[1])
-                                if 16 <= second_octet <= 31:
-                                    return ip
-                            except (ValueError, IndexError):
-                                pass
-        except ImportError:
+                        if ip == "127.0.0.1": continue
+                        if ip.startswith("169.254"): continue
+                        if any(ip.startswith(ex) for ex in excluded_subnets): continue
+                        
+                        candidates.append(ip)
+        except:
             pass
-        except Exception:
-            pass
-        
-        # Fallback to socket trick
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            if ip.startswith('192.168.') or ip.startswith('10.'):
-                return ip
-        except Exception:
-            pass
-        
-        return "127.0.0.1"
+
+        # Fallback using socket if psutil failed or yielded nothing
+        if not candidates:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                # Doesn't actually connect, just picks interface
+                s.connect(("8.8.8.8", 80)) 
+                ip = s.getsockname()[0]
+                s.close()
+                if ip != "127.0.0.1" and not ip.startswith("169.254"):
+                    candidates.append(ip)
+            except:
+                pass
+
+        if not candidates:
+            return "127.0.0.1"
+
+        # Prioritize 192.168 -> 10 -> 172
+        def score_ip(ip):
+            if ip.startswith("192.168."): return 3
+            if ip.startswith("10."): return 2
+            if ip.startswith("172."): return 1
+            return 0
+
+        candidates.sort(key=score_ip, reverse=True)
+        return candidates[0]
     
     def advertise_room(self, room_id: str, token: str, port: int, device_id: str = "HOST") -> bool:
         """
@@ -71,10 +86,14 @@ class RoomDiscovery:
             True if advertisement successful, False otherwise
         """
         try:
+            # Cleanup previous if any
+            if self.service_info:
+                 self.stop_advertising()
+                 
             if not self.zeroconf:
                 self.zeroconf = Zeroconf()
             
-            hostname = socket.gethostname()
+            hostname = socket.gethostname().split('.')[0] # Clean hostname
             local_ip = self._get_local_ip()
             
             # Create service info
@@ -179,28 +198,42 @@ class RoomDiscovery:
         """Stop advertising the current room."""
         try:
             if self.service_info and self.zeroconf:
-                self.zeroconf.unregister_service(self.service_info)
+                try:
+                    self.zeroconf.unregister_service(self.service_info)
+                except RuntimeError:
+                    # Event loop already closed, ignore
+                    pass
                 self.service_info = None
                 logger.info("Stopped advertising room")
         except Exception as e:
-            logger.error(f"Error stopping advertisement: {e}")
+            # Only log if it's not an event loop error
+            if "Event loop is closed" not in str(e):
+                logger.error(f"Error stopping advertisement: {e}")
     
     def stop(self):
         """Stop discovery and cleanup resources."""
         try:
             if self.browser:
-                self.browser.cancel()
+                try:
+                    self.browser.cancel()
+                except RuntimeError:
+                    pass
                 self.browser = None
             
             self.stop_advertising()
             
             if self.zeroconf:
-                self.zeroconf.close()
+                try:
+                    self.zeroconf.close()
+                except RuntimeError:
+                    # Event loop already closed, ignore
+                    pass
                 self.zeroconf = None
             
             logger.info("Discovery stopped")
         except Exception as e:
-            logger.error(f"Error stopping discovery: {e}")
+            if "Event loop is closed" not in str(e):
+                logger.error(f"Error stopping discovery: {e}")
     
     def __del__(self):
         """Cleanup on deletion."""

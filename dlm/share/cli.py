@@ -56,6 +56,16 @@ def handle_share_command(args, bus):
     elif action == 'receive':
         # Legacy: Direct receive (Phase 1 compatibility)
         _do_receive(args, bus)
+    elif action == 'join':
+        # Automated join from script or CLI
+        _do_join_automated(args, bus)
+    elif action == 'room':
+        # Phase 2: Direct room management
+        room_action = getattr(args, 'room_action', None)
+        if room_action == 'create':
+            _do_room_create(bus)
+        else:
+            print("Usage: dlm share room create")
     else:
         # Phase 2: Interactive TUI
         try:
@@ -65,6 +75,16 @@ def handle_share_command(args, bus):
             print(f"Error: TUI not available: {e}")
             print("Falling back to legacy mode...")
             print("Usage: dlm share send [file-path] | dlm share receive [ip] [port] [token]")
+
+def _do_room_create(bus):
+    """Start index room directly."""
+    from .room_manager import RoomManager
+    from .tui import ShareTUI
+    rm = RoomManager()
+    tui = ShareTUI(rm, bus)
+    tui._direct_mode = True
+    tui._create_room()
+    tui.run()
 
 def _do_send(bus, file_path=None):
     import time
@@ -124,7 +144,7 @@ def _do_send(bus, file_path=None):
         
         while True:
             # Poll Server State
-            bytes_sent = getattr(server, '_bytes_sent', 0)
+            bytes_sent = getattr(server, 'total_bytes_sent', 0)
             speed = getattr(server, 'current_speed', 0.0)
             total = entry.size_bytes
             
@@ -217,3 +237,35 @@ def _do_receive(args, bus):
             tui.monitor_task(dl_id, custom_header=header)
         except KeyboardInterrupt:
             pass
+
+def _do_join_automated(args, bus):
+    """Handle joining via CLI flags (for scripts)."""
+    ip = getattr(args, 'ip', None)
+    port = getattr(args, 'port', None)
+    token = getattr(args, 'token', None)
+    
+    if not all([ip, port, token]):
+        print("Error: --ip, --port, and --token are required for automated join.")
+        return
+        
+    client = ShareClient(bus)
+    success = client.join_room(ip, port, token, "Guest") # Default name for script joins
+    if success:
+        print(f"✅ Successfully joined room at {ip}:{port}")
+        # Phase 2: Open TUI in lobby mode
+        try:
+            from .tui import run_share_tui # Using the convenience runner
+            # We need to ensure RoomManager knows about this room
+            from .room_manager import RoomManager
+            rm = RoomManager()
+            rm.join_room("RECV", ip, port, token)
+            # Re-run TUI with this manager
+            from .tui import ShareTUI
+            tui = ShareTUI(rm, bus)
+            tui.client = client
+            tui.screen = "lobby"
+            tui.run()
+        except Exception as e:
+            print(f"Joined, but TUI failed to start: {e}")
+    else:
+        print(f"❌ Failed to join room at {ip}:{port}. Check network or token.")

@@ -3,8 +3,11 @@ import time
 from typing import Dict, Set, List, Optional
 try:
     import libtorrent as lt
+    HAVE_LIBTORRENT = True
 except ImportError:
     lt = None
+    HAVE_LIBTORRENT = False
+    # Silent - libtorrent is optional
 
 class SharedTorrentController:
     """

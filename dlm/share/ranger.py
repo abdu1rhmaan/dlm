@@ -25,6 +25,10 @@ class RangerBrowser:
         self.last_added_msg: Optional[str] = None
         self.exit_code: bool = False
         
+        # Folder Unit Prompt State
+        self.prompt_active = False
+        self.prompt_target: Optional[Path] = None
+        
         self._refresh_items()
         
         self.style = Style.from_dict({
@@ -58,8 +62,12 @@ class RangerBrowser:
         return HTML(f"  <header>Browsing:</header> {self.current_dir.resolve()}\n")
 
     def _get_footer_text(self):
+        if self.prompt_active:
+            msg = f"\n  <confirm>Send '{self.prompt_target.name}' as a Folder Unit? [y/n]</confirm>\n"
+            return HTML(msg)
+            
         msg = f"\n  <footer-msg>{self.last_added_msg if self.last_added_msg else ''}</footer-msg>\n"
-        msg += "  <b>[Enter]</b> Add File/Folder  <b>[←/Backspace]</b> Back  <b>[q]</b> Done"
+        msg += "  <b>[Enter]</b> Add  <b>[→]</b> Enter Dir  <b>[←/Backspace]</b> Back  <b>[q]</b> Done"
         return HTML(msg)
 
     def _get_items_text(self):
@@ -96,24 +104,32 @@ class RangerBrowser:
 
         @self.kb.add('enter')
         def _(event):
-            if not self.items:
+            if self.prompt_active or not self.items:
                 return
                 
             selected = self.items[self.selected_index]
             if selected.is_dir():
-                # Option 1: Enter directory
-                # But user also wants Enter to add folder recursively.
-                # Let's make Right Arrow enter, and Enter ADD.
-                # Actually, standard ranger is Right to enter.
-                # Let's stick to user request: "Enter: If file -> add, If folder -> add folder recursively"
-                count = self.on_add(selected)
-                if selected.is_dir():
-                    self.last_added_msg = f"✔ Added folder: {selected.name} ({count} files)"
-                else:
-                    self.last_added_msg = f"✔ Added file: {selected.name}"
+                self.prompt_active = True
+                self.prompt_target = selected
             else:
-                count = self.on_add(selected)
+                count = self.on_add(selected, False)
                 self.last_added_msg = f"✔ Added file: {selected.name}"
+
+        @self.kb.add('y', filter=Condition(lambda: self.prompt_active))
+        def _(event):
+            count = self.on_add(self.prompt_target, True)
+            self.last_added_msg = f"✔ Added folder unit: {self.prompt_target.name}"
+            self.prompt_active = False
+            self.prompt_target = None
+
+        @self.kb.add('n', filter=Condition(lambda: self.prompt_active))
+        def _(event):
+            # If no, enter directory instead? Or just cancel?
+            # User workflow: Enter -> Prompt "Send Folder?". No -> Do nothing (allow user to Right Arrow into it if they want)
+            # OR logic: No -> Enter folder?
+            # Let's stick to: No -> Cancel prompt. User can use Right Arrow to browse.
+            self.prompt_active = False
+            self.prompt_target = None
 
         @self.kb.add('right')
         def _(event):
@@ -165,7 +181,7 @@ class RangerBrowser:
         app.run()
 
 
-def pick_with_ranger(on_add_callback: Callable[[Path], int]):
+def pick_with_ranger(on_add_callback: Callable[[Path, bool], int]):
     """Helper to launch ranger browser."""
     browser = RangerBrowser(on_add_callback)
     browser.run()

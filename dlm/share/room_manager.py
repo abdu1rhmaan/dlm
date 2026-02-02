@@ -29,44 +29,52 @@ class RoomManager:
             return "Unknown"
     
     def _get_local_ip(self) -> str:
-        """Get local IP address (reuse logic from server)."""
+        """Get the actual LAN IP address, filtering virtual adapters."""
         try:
             import psutil
+            BLACKLIST = ['vbox', 'docker', 'virtual', 'wsl', 'tailscale', 'zerotier', 'vpn', 'vmnet']
+            candidates = []
+            
             for interface, addrs in psutil.net_if_addrs().items():
+                if any(b in interface.lower() for b in BLACKLIST):
+                    continue
                 for addr in addrs:
-                    if addr.family == 2:  # AF_INET (IPv4)
+                    if addr.family == 2:  # AF_INET
                         ip = addr.address
-                        # Prioritize 192.168.x.x, then 10.x.x.x
-                        if ip.startswith('192.168.'):
-                            return ip
-                        elif ip.startswith('10.'):
-                            return ip
+                        if ip.startswith('127.'): continue
+                        
+                        score = 70
+                        if ip.startswith('192.168.1.') or ip.startswith('192.168.0.'): score = 100
+                        elif ip.startswith('192.168.56.'): score = 10  # Deprioritize VBox
+                        elif ip.startswith('192.168.'): score = 95
+                        elif ip.startswith('10.'): score = 90
                         elif ip.startswith('172.'):
                             try:
-                                second_octet = int(ip.split('.')[1])
-                                if 16 <= second_octet <= 31:
-                                    return ip
-                            except (ValueError, IndexError):
-                                pass
-        except ImportError:
+                                second = int(ip.split('.')[1])
+                                if 16 <= second <= 31: score = 80
+                            except: pass
+                        candidates.append((score, ip))
+            
+            if candidates:
+                candidates.sort(reverse=True)
+                return candidates[0][1]
+        except:
             pass
-        except Exception:
-            pass
-        
+
         # Fallback to socket trick
         try:
+            import socket
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
             ip = s.getsockname()[0]
             s.close()
-            if ip.startswith('192.168.') or ip.startswith('10.'):
-                return ip
-        except Exception:
+            return ip
+        except:
             pass
         
         return "127.0.0.1"
     
-    def create_room(self, host_ip: str = None, port: int = 8080) -> Room:
+    def create_room(self, host_ip: str = None, port: int = 0) -> Room:
         """Create a new room and set as current."""
         if host_ip is None:
             host_ip = self._get_local_ip()
@@ -75,7 +83,9 @@ class RoomManager:
             room_id=Room.generate_room_id(),
             token=Room.generate_token(),
             host_ip=host_ip,
-            port=port
+            port=port,
+            host_device_name=self.device_name,
+            host_device_id=self.device_id
         )
         
         # Add self as first device

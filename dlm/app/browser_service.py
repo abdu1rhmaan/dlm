@@ -3,7 +3,6 @@ import time
 import json
 import sqlite3
 from pathlib import Path
-from playwright.async_api import async_playwright
 import traceback
 from urllib.parse import urlparse
 
@@ -78,6 +77,20 @@ def get_db() -> Path:
 
 async def browser_command(target_url: str = None):
     """المحرك الرئيسي لتشغيل المتصفح واصطياد الروابط والتحميلات."""
+    
+    # Lazy import playwright with error handling
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        print("\n❌ Error: Playwright is not installed.")
+        print("📦 To use the browser feature, install it via Feature Manager:")
+        print("   dlm launcher")
+        print("   Then select 'Browser' feature and install dependencies.")
+        print("\nOr install manually:")
+        print("   pip install playwright")
+        print("   playwright install chromium")
+        return
+    
     project_root = get_project_root()
     profiles_dir = project_root / "data" / "browser_profiles"
     profiles_dir.mkdir(parents=True, exist_ok=True)

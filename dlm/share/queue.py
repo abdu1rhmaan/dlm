@@ -6,11 +6,12 @@ from pathlib import Path
 
 
 @dataclass
-class QueuedFile:
-    """Represents a file in the transfer queue."""
+class QueuedItem:
+    """Represents a file or folder in the transfer queue."""
     file_path: Path
+    is_dir: bool = False
     # Phase 2 Targeting
-    target_devices: List[str] = field(default_factory=lambda: ["ALL"])
+    target_device_id: str = "ALL"
     added_by: str = "local"
     
     status: str = "pending"  # pending, transferring, completed, failed, skipped
@@ -24,47 +25,57 @@ class QueuedFile:
     
     @property
     def file_size(self) -> int:
-        """Get file size in bytes."""
+        """Get file or directory size in bytes."""
         try:
-            return self.file_path.stat().st_size
+            if not self.is_dir:
+                return self.file_path.stat().st_size
+            else:
+                return sum(f.stat().st_size for f in self.file_path.rglob('*') if f.is_file())
         except:
             return 0
 
+# Alias for compatibility
+QueuedFile = QueuedItem
+
 
 class TransferQueue:
-    """Manages multi-file transfer queue."""
+    """Manages multi-file/folder transfer queue."""
     
     def __init__(self):
-        self.queue: List[QueuedFile] = []
+        self.queue: List[QueuedItem] = []
         self.current_index: int = 0
     
-    def add_path(self, path: Path, target_devices: List[str] = None):
-        """Add file or folder (recursively) to queue."""
-        if target_devices is None:
-            target_devices = ["ALL"]
-            
+    def add_path(self, path: Path, target_device_id: str = "ALL", as_folder: bool = False):
+        """Add file or folder to queue."""
         if path.is_file():
-            self._add_single_file(path, target_devices)
+            self._add_single_item(path, target_device_id, is_dir=False)
             return 1
         elif path.is_dir():
-            count = 0
-            for p in path.rglob("*"):
-                if p.is_file():
-                    self._add_single_file(p, target_devices)
-                    count += 1
-            return count
+            if as_folder:
+                # Add as a single directory unit
+                self._add_single_item(path, target_device_id, is_dir=True)
+                return 1
+            else:
+                # Legacy: Expand recursively (add independent files)
+                count = 0
+                for p in path.rglob("*"):
+                    if p.is_file():
+                        self._add_single_item(p, target_device_id, is_dir=False)
+                        count += 1
+                return count
         return 0
 
-    def _add_single_file(self, file_path: Path, target_devices: List[str]):
-        # Prevent duplicates in current queue
+    def _add_single_item(self, file_path: Path, target_device_id: str, is_dir: bool):
+        # Prevent duplicates
         if any(f.file_path == file_path for f in self.queue):
             return
             
-        queued_file = QueuedFile(
+        queued_item = QueuedItem(
             file_path=file_path,
-            target_devices=list(target_devices)
+            is_dir=is_dir,
+            target_device_id=target_device_id
         )
-        self.queue.append(queued_file)
+        self.queue.append(queued_item)
     
     def remove_item(self, index: int):
         """Remove item by index."""
@@ -115,8 +126,13 @@ class TransferQueue:
         """Get all pending files."""
         return [f for f in self.queue[self.current_index:] if f.status == "pending"]
 
+    def clear_completed(self):
+        """Remove completed and failed items from queue."""
+        self.queue = [f for f in self.queue if f.status not in ("completed", "failed", "skipped")]
+        self.current_index = 0
+
     def clear(self):
-        """Clear the queue."""
+        """Clear the entire queue."""
         self.queue = []
         self.current_index = 0
     

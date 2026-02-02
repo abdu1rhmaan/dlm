@@ -2535,9 +2535,10 @@ class DownloadService:
                     
                     if isinstance(e, ServerError):
                         if "403" in str(e) or "401" in str(e) or "410" in str(e):
-                            # SMART RENEW TRIGGER
-                            print(f"[RENEW] 403 Error detected for {dl.target_filename}. Triggering Smart Renew.")
-                            self.trigger_renewal(dl.id)
+                            # SMART RENEW TRIGGER: Only for non-share, non-ephemeral tasks
+                            if dl.source != 'share' and not getattr(dl, 'ephemeral', False):
+                                print(f"[RENEW] 403 Error detected for {dl.target_filename}. Triggering Smart Renew.")
+                                self.trigger_renewal(dl.id)
                             return
                         if attempt < 2: 
                             time.sleep(retry_delay)
@@ -2603,10 +2604,12 @@ class DownloadService:
 
         except Exception as e:
             if not cancel_event.is_set():
-                if "403" in str(e) or "401" in str(e) or "410" in str(e):
+                err_msg = str(e)
+                if "403" in err_msg or "401" in err_msg or "410" in err_msg:
                     # SMART RENEW TRIGGER for streams
-                    print(f"[RENEW] 403 Error detected for {dl.target_filename}. Triggering Smart Renew.")
-                    self.trigger_renewal(dl.id)
+                    if dl.source != 'share' and not getattr(dl, 'ephemeral', False):
+                        print(f"[RENEW] 403 Error detected for {dl.target_filename}. Triggering Smart Renew.")
+                        self.trigger_renewal(dl.id)
                 else:
                     dl.fail(f"Stream error: {e}")
                     if not getattr(dl, 'ephemeral', False):
