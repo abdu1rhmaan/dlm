@@ -276,19 +276,20 @@ class ShareServer:
         async def auth(request: Request):
             data = await request.json()
             token = data.get("token")
-            if self.auth_manager.validate_token(token, self.room):
-                session_id = secrets.token_hex(16)
-                self.auth_manager.register_session(session_id)
-                return {"session_id": session_id}
+            if not self.room:
+                 raise HTTPException(status_code=500, detail="Room not initialized")
+            session = self.auth_manager.create_session(token, self.room)
+            if session:
+                return {"session_id": session.session_id}
             raise HTTPException(status_code=401, detail="Invalid token")
 
         # 2. Dependency for protected routes
         def verify_session(request: Request):
             auth_header = request.headers.get("Authorization")
             if auth_header and auth_header.startswith("Bearer "):
-                 session_id = auth_header.split(" ")[1]
-                 if self.auth_manager.validate_session(session_id):
-                      return session_id
+                session_id = auth_header.split(" ")[1]
+                if self.auth_manager.validate_session(session_id):
+                    return session_id
             
             token = request.query_params.get("token")
             if token:
