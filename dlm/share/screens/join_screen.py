@@ -91,7 +91,9 @@ class JoinScreen(Screen):
             connected = await self.app.join_room(room['ip'], room['port'])
             if connected:
                 await self.app.switch_mode("room")
-                self.app.get_screen("room").init_room_state()
+                # Now self.app.screen is the RoomScreen
+                if hasattr(self.app.screen, "init_room_state"):
+                     self.app.screen.init_room_state()
             else:
                 self.query_one("#scan-status").update("CONNECTION FAILED!")
 
