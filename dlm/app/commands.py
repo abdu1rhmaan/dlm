@@ -131,18 +131,7 @@ class UpdateExternalTask(Command):
     speed: float = 0.0
     state: str = None # Optional state update
 
-@dataclass
-class ShareNotify(Command):
-    message: str
-    is_error: bool = False
 
-@dataclass
-class TakeoverRoom(Command):
-    """Event for transitioning a participant to become the host."""
-    room_id: str
-    token: str
-    files: List[Dict[str, Any]]
-    devices: List[Dict[str, Any]]
 
 
 

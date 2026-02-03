@@ -12,6 +12,12 @@ class Feature:
     system_dependencies: List[str] = field(default_factory=list) # e.g. ffmpeg
     is_core: bool = False
     estimated_size: str = "~50MB"
+    entry_command: str = ""
+    
+    @property
+    def dependencies(self) -> List[str]:
+        """Backward compatibility property for launcher CLI."""
+        return self.pip_dependencies
 
     def is_installed(self) -> bool:
         """Check if all dependencies are satisfied."""
@@ -37,12 +43,7 @@ FEATURES = [
         pip_dependencies=["requests", "urllib3"],
         is_core=True
     ),
-    Feature(
-        id="share",
-        name="LAN Share (Phase 2)",
-        description="Keyboard-first local file sharing TUI",
-        pip_dependencies=["fastapi", "uvicorn", "zeroconf", "qrcode", "prompt_toolkit"]
-    ),
+
     Feature(
         id="youtube",
         name="Social - YouTube",
@@ -88,6 +89,15 @@ FEATURES = [
         description="AI-powered vocal and music separation",
         pip_dependencies=["demucs"],
         system_dependencies=["ffmpeg"]
+    ),
+    Feature(
+        id="share",
+        name="Share - Local Network",
+        description="Share files on local network (LAN)",
+        pip_dependencies=["fastapi", "uvicorn", "zeroconf", "qrcode", "psutil"],
+        is_core=False,
+        estimated_size="~10MB",
+        entry_command="dlm share"
     ),
 ]
 

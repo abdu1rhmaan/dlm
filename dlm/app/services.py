@@ -120,7 +120,7 @@ class DownloadService:
         
         # Track active downloads in memory
         self._active_downloads: Dict[str, Download] = {}
-        self._ephemeral_memory: Dict[str, Download] = {} # Live tasks (Share), NO DB persistence
+        self._ephemeral_memory: Dict[str, Download] = {} # Live tasks, NO DB persistence
         self._cancel_events: Dict[str, threading.Event] = {}
         self._last_tiktok_profile_download: Dict[str, float] = {} # For rate-limit guard
         self._batch_queue: deque = deque() # Real ordered queue for batch tasks
@@ -294,33 +294,13 @@ class DownloadService:
         """
         with self._lock:
             while True:
-                # [SHARE-PRIORITY] Phase 14: Prioritize share tasks (ephemeral, high speed)
-                # We check batch_queue for any 'share' task and move it to the front if found
-                # Or just start it immediately bypassing concurrency.
-                
-                # 1. Identify high-priority share tasks in queue
-                # We search the whole batch_queue for a share task
-                share_idx = -1
-                for i, tid in enumerate(self._batch_queue):
-                    dl = self.repository.get(tid)
-                    if dl and dl.source == 'share':
-                        share_idx = i
-                        break
-                
                 download_id = None
-                if share_idx != -1:
-                    # Found a share task! Pop it regardless of position
-                    # This effectively implements a priority queue for share tasks
-                    download_id = self._batch_queue[share_idx]
-                    del self._batch_queue[share_idx]
-                    # Share tasks BYPASS concurrency entirely
-                elif self._get_active_count() >= self.concurrency_limit:
-                    # Only break if no share tasks AND at capacity
-                    break
-                else:
-                    # 2. Standard Batch Queue pop
-                    if self._batch_queue:
-                        download_id = self._batch_queue.popleft()
+                # Don't break the entire loop if at capacity - we need to check for completed downloads that free up slots
+                # The individual task check below will handle concurrency limits properly
+                
+                # 2. Standard Batch Queue pop
+                if self._batch_queue:
+                    download_id = self._batch_queue.popleft()
                 
                 # 3. If Batch Queue empty, check for WAITING tasks in DB
                 if not download_id:
@@ -331,16 +311,12 @@ class DownloadService:
                 if not download_id:
                     break
                 
-                # [FIX] Priority bypass for share tasks to ensure instant LAN transfer
                 # Re-fetch dl to check source, as download_id might have come from DB
                 dl = self.repository.get(download_id) if download_id else None
                 active_count = self._get_active_count()
                 
-                if dl and dl.source == 'share':
-                    # Skip concurrency limits and start immediately
-                    pass
-                elif dl and dl.source != 'share' and active_count >= self.concurrency_limit:
-                    # If it's not a share task and we're at capacity, don't start it
+                if dl and active_count >= self.concurrency_limit:
+                    # If we're at capacity, don't start it
                     continue
                 
                 if download_id in self._active_downloads:
@@ -579,14 +555,7 @@ class DownloadService:
             # 3. Finalize State & Queue
             self._on_task_terminated(dl)
             
-            # 4. Auto-delete share downloads (ephemeral)
-            if dl.source == 'share' or (dl.source == 'upload' and dl.url == 'external://transfer'):
-                import threading
-                def cleanup_share():
-                    import time
-                    time.sleep(1)  # Wait for TUI to show completion
-                    self.repository.delete(dl.id)
-                threading.Thread(target=cleanup_share, daemon=True).start()
+
                             
         except Exception as e:
              print(f"[CLEANUP] Error: {e}")
@@ -765,9 +734,9 @@ class DownloadService:
 
             # Step 2: Standard HTTP
         try:
-            # Phase 20: Optimization for LAN/Share URLs
+            # Phase 20: Optimization for LAN URLs
             is_lan = any(prefix in url for prefix in ["192.168.", "10.", "172."])
-            if source == 'share' or is_lan:
+            if is_lan:
                 dl.total_size = total_size
                 dl.resumable = True # LAN transfers are assumed resumable (dlm-to-dlm)
             elif total_size > 0:
@@ -803,9 +772,7 @@ class DownloadService:
             if not dl.resumable:
                 dl.resumable = self.network.supports_ranges(url, referer=dl.referer)
             
-            # Phase 20: Ensure share tasks always initialize segments
-            if dl.source == 'share' and dl.total_size > 0:
-                dl.resumable = True
+
                 
             self._initialize_segments(dl)
             dl.state = DownloadState.QUEUED
@@ -911,13 +878,11 @@ class DownloadService:
             if download_id in self._discovery_tasks: return
             
             # 1.5 Concurrency Check
-            # [SHARE-FIX] Bypass concurrency limit for share tasks (ephemeral, time-sensitive)
-            if dl.source != 'share':
-                # If we are already at capacity, let it stay in WAITING/QUEUED/DEQUE
-                if self._get_active_count() >= self.concurrency_limit:
-                    if dl.state != DownloadState.WAITING:
-                        dl.state = DownloadState.WAITING
-                        self.repository.save(dl)
+            # If we are already at capacity, let it stay in WAITING/QUEUED/DEQUE
+            if self._get_active_count() >= self.concurrency_limit:
+                if dl.state != DownloadState.WAITING:
+                    dl.state = DownloadState.WAITING
+                    self.repository.save(dl)
                     return
 
         # 2. Resource Discovery if size unknown
@@ -960,7 +925,7 @@ class DownloadService:
             self.executor.submit(do_discovery)
             return
 
-        # [ARCH-FIX] Ensure segments are initialized for known-size downloads (e.g. Share)
+        # [ARCH-FIX] Ensure segments are initialized for known-size downloads
         # This prevents them from falling back to _stream_worker which might have progress tracking issues for known sizes.
         if dl.total_size > 0 and not dl.segments and dl.source not in ['youtube', 'tiktok', 'spotify', 'torrent']:
              self._initialize_segments(dl)
@@ -1362,22 +1327,6 @@ class DownloadService:
             threading.Thread(target=self._monitor_download, args=(dl, cancel_event), daemon=True).start()
             return
 
-        # 1.5. Branch for Share Downloads (Real-time Progress)
-        if dl.source == 'share':
-            with self._lock:
-                dl.state = DownloadState.DOWNLOADING
-                dl.error_message = None
-                self.repository.save(dl)
-                self._active_downloads[dl.id] = dl
-                cancel_event = threading.Event()
-                self._cancel_events[dl.id] = cancel_event
-                dl._futures = []
-            
-            f = self.executor.submit(self._share_download_worker, dl, cancel_event)
-            dl._futures.append(f)
-            threading.Thread(target=self._monitor_download, args=(dl, cancel_event), daemon=True).start()
-            return
-
         # 2. Standard HTTP Pipeline
         self._validate_and_rollback(dl)
         
@@ -1600,125 +1549,7 @@ class DownloadService:
                 self.repository.save(dl)
                 self._cleanup_on_completion(dl)
 
-    def _share_download_worker(self, dl: Download, cancel_event: threading.Event):
-        """Dedicated worker for share downloads with optimized streaming and stable speed reporting."""
-        import requests
-        import time
-        from collections import deque
-        
-        folder = self._get_download_folder(dl)
-        folder.mkdir(parents=True, exist_ok=True)
-        target_file = folder / dl.target_filename
-        
-        try:
-            # Use requests.get with stream=True for chunked reading
-            response = requests.get(dl.url, stream=True, timeout=30)
-            response.raise_for_status()
-            
-            # Verify total size matches
-            content_length = response.headers.get('Content-Length')
-            if content_length:
-                server_size = int(content_length)
-                if server_size != dl.total_size:
-                    dl.fail(f"Size mismatch: expected {dl.total_size}, got {server_size}")
-                    self.repository.save(dl)
-                    return
-            
-            # Download configuration
-            downloaded_bytes = 0
-            chunk_size = 512 * 1024  # 512KB chunks (up from 64KB for stability)
-            buffer_size = 2 * 1024 * 1024  # 2MB write buffer
-            
-            # Speed smoothing with moving average
-            speed_window = deque(maxlen=20)  # Last 20 samples (~2 seconds at 100ms intervals)
-            last_update_time = time.time()
-            last_update_bytes = 0
-            
-            # Buffered writing
-            chunk_buffer = []
-            buffer_bytes = 0
-            
-            with open(target_file, 'wb', buffering=buffer_size) as f:
-                # [SHARE-SYNC] Ensure segments are ready for progress tracking
-                if not dl.segments and dl.total_size > 0:
-                    self._initialize_segments(dl)
-                
-                for chunk in response.iter_content(chunk_size=chunk_size):
-                    if cancel_event.is_set():
-                        dl.state = DownloadState.PAUSED
-                        self.repository.save(dl)
-                        return
-                    
-                    if chunk:
-                        # Add to buffer
-                        chunk_buffer.append(chunk)
-                        chunk_len = len(chunk)
-                        buffer_bytes += chunk_len
-                        downloaded_bytes += chunk_len
-                        
-                        # [PROGRESS-SYNC] Update Segment 0 for Monitor & TUI
-                        if dl.segments:
-                            dl.segments[0].downloaded_bytes = downloaded_bytes
-                        else:
-                            # Fallback if segments missing
-                            dl._downloaded_bytes_override = downloaded_bytes
-                        
-                        # Write buffer when threshold reached
-                        if buffer_bytes >= buffer_size:
-                            for buffered_chunk in chunk_buffer:
-                                f.write(buffered_chunk)
-                            chunk_buffer = []
-                            buffer_bytes = 0
-                        
-                        # Calculate smoothed speed
-                        current_time = time.time()
-                        time_diff = current_time - last_update_time
-                        
-                        if time_diff >= 0.1:  # Update every 100ms
-                            bytes_diff = downloaded_bytes - last_update_bytes
-                            instant_speed = bytes_diff / time_diff if time_diff > 0 else 0
-                            
-                            # Add to moving average window
-                            speed_window.append(instant_speed)
-                            
-                            # Calculate smoothed speed (average of window)
-                            smoothed_speed = sum(speed_window) / len(speed_window) if speed_window else 0
-                            
-                            # Update dl speed for monitor/db
-                            dl.speed_bps = smoothed_speed
-                            
-                            # Emit progress update with smoothed speed
-                            from dlm.app.commands import UpdateExternalTask
-                            if hasattr(self, 'bus') and self.bus:
-                                self.bus.handle(UpdateExternalTask(
-                                    id=dl.id,
-                                    downloaded_bytes=downloaded_bytes,
-                                    speed=smoothed_speed
-                                ))
-                            
-                            # Periodically save state to DB for TUI lobby
-                            self.repository.save(dl)
-                            
-                            last_update_time = current_time
-                            last_update_bytes = downloaded_bytes
-                
-                # Flush remaining buffer
-                for buffered_chunk in chunk_buffer:
-                    f.write(buffered_chunk)
-            
-            # Final update and completion
-            dl.state = DownloadState.COMPLETED
-            self.repository.save(dl)
-            self._cleanup_on_completion(dl)
-            
-        except requests.exceptions.RequestException as e:
-            dl.fail(f"Download failed: {e}")
-            self.repository.save(dl)
-        except Exception as e:
-            dl.fail(f"Unexpected error: {e}")
-            self.repository.save(dl)
-        finally:
-            self._on_task_terminated(dl)
+
 
     def _vocals_loop(self):
         """Background worker for monitoring and processing vocals queue."""
@@ -2525,14 +2356,28 @@ class DownloadService:
                         mode = "ab" if seg.downloaded_bytes > 0 else "wb"
                         file_offset = None
                     
+                    import time
                     with open(part_file, mode) as f:
                         # Seek to correct position for shared file
                         if use_shared_file and file_offset is not None:
                             f.seek(file_offset)
                         
+                        first_data_received = False
+                        start_time = time.time()
+                        timeout_seconds = 10  # Timeout to wait for first data
+                        
                         for chunk in iter_data:
                             if cancel_event.is_set():
                                 return
+                            
+                            # Check for first data transfer
+                            if not first_data_received:
+                                if chunk and len(chunk) > 0:
+                                    first_data_received = True
+                                    # Mark download as actually downloading after real data transfer
+                                    if dl.state != DownloadState.DOWNLOADING:
+                                        dl.state = DownloadState.DOWNLOADING
+                                        self.repository.save(dl)
                             
                             # RACE CONDITION FIX:
                             # Always read the fresh authoritative end_byte
@@ -2568,6 +2413,13 @@ class DownloadService:
                             
                             if seg.downloaded_bytes >= (seg.end_byte - seg.start_byte + 1):
                                 break # STRICT BREAK: Exact size reached
+                        
+                        # If we never received any data and timeout passed, this is a failed download
+                        if not first_data_received:
+                            # Check if we waited too long without receiving data
+                            elapsed = time.time() - start_time
+                            if elapsed >= timeout_seconds:
+                                raise Exception(f"Timeout waiting for data transfer: {timeout_seconds}s elapsed without receiving any data")
                     
                     # Check completion AFTER loop
                     if seg.downloaded_bytes == (seg.end_byte - seg.start_byte + 1):
@@ -2597,8 +2449,8 @@ class DownloadService:
                     
                     if isinstance(e, ServerError):
                         if "403" in str(e) or "401" in str(e) or "410" in str(e):
-                            # SMART RENEW TRIGGER: Only for non-share, non-ephemeral tasks
-                            if dl.source != 'share' and not getattr(dl, 'ephemeral', False):
+                            # SMART RENEW TRIGGER: Only for non-ephemeral tasks
+                            if not getattr(dl, 'ephemeral', False):
                                 print(f"[RENEW] 403 Error detected for {dl.target_filename}. Triggering Smart Renew.")
                                 self.trigger_renewal(dl.id)
                             return
@@ -2626,6 +2478,7 @@ class DownloadService:
 
 
     def _stream_worker(self, dl: Download, cancel_event: threading.Event):
+        import time
         folder = self._get_download_folder(dl)
         # Use data.part for workspace tasks, otherwise {filename}.part
         part_file = folder / ("data.part" if dl.task_id else f"{dl.target_filename}.part")
@@ -2639,15 +2492,36 @@ class DownloadService:
             )
             
             downloaded_count = 0
+            first_data_received = False
+            start_time = time.time()
+            timeout_seconds = 10  # Timeout to wait for first data
+            
             with open(part_file, "wb") as f:
                 for chunk in iter_data:
                     if cancel_event.is_set():
                         return
+                    
+                    # Check for first data transfer
+                    if not first_data_received:
+                        if chunk and len(chunk) > 0:
+                            first_data_received = True
+                            # Mark download as actually downloading after real data transfer
+                            if dl.state != DownloadState.DOWNLOADING:
+                                dl.state = DownloadState.DOWNLOADING
+                                self.repository.save(dl)
+                    
                     f.write(chunk)
                     if not dl.segments:
                         dl.segments.append(Segment(0, 0))
                     dl.segments[0].downloaded_bytes += len(chunk)
                     downloaded_count += len(chunk)
+                
+                # If we never received any data and timeout passed, this is a failed download
+                if not first_data_received and downloaded_count == 0:
+                    # Check if we waited too long without receiving data
+                    elapsed = time.time() - start_time
+                    if elapsed >= timeout_seconds:
+                        raise Exception(f"Timeout waiting for data transfer: {timeout_seconds}s elapsed without receiving any data")
             
             # [FIX] Enforce Strict Completion if Size Known
             if dl.total_size and dl.total_size > 0:
@@ -2669,7 +2543,7 @@ class DownloadService:
                 err_msg = str(e)
                 if "403" in err_msg or "401" in err_msg or "410" in err_msg:
                     # SMART RENEW TRIGGER for streams
-                    if dl.source != 'share' and not getattr(dl, 'ephemeral', False):
+                    if not getattr(dl, 'ephemeral', False):
                         print(f"[RENEW] 403 Error detected for {dl.target_filename}. Triggering Smart Renew.")
                         self.trigger_renewal(dl.id)
                 else:
@@ -2912,6 +2786,8 @@ class DownloadService:
                 return self._ephemeral_memory[download_id]
             if download_id in self._active_downloads:
                 return self._active_downloads[download_id]
+            # Fall back to repository
+            return self.repository.get(download_id)
 
     def get_all_downloads(self, include_ephemeral: bool = False):
         """Get all downloads, optionally including in-memory ephemeral ones."""
@@ -3083,168 +2959,17 @@ class DownloadService:
 
 
     def _start_torrent_split_download(self, dl: Download):
-        """Start split torrent download using SharedTorrentController."""
+        """Start split torrent download."""
         try:
-            from dlm.infra.network.shared_torrent import SharedTorrentController
-            
-            # 1. Get Controller
-            controller = SharedTorrentController()
-            
-            # 2. Resolve Save Path (Workspace/Folder)
-            # CRITICAL: All split tasks for the same torrent MUST use the SAME save_path
-            # Otherwise libtorrent will create duplicate file structures
-            
-            # Get the workspace root (parent folder containing all tasks)
-            from dlm.core.workspace import WorkspaceManager
-            wm = WorkspaceManager(self.download_dir.parent)
-            
-            # Use the workspace root as save_path
-            # This ensures all tasks write to the same torrent file structure
-            workspace_root = self.download_dir.parent / "__workspace__"
-            workspace_root.mkdir(parents=True, exist_ok=True)
-            
-            save_path = str(workspace_root)
-            
-            # 3. Get/Add Handle
-            handle = controller.get_handle(dl.url, save_path)
-            if not handle:
-                dl.fail("Failed to get torrent handle")
-                self._on_task_terminated(dl)
-                return
-
-            # 4. Wait for Metadata (if needed to map pieces)
-            if not handle.status().has_metadata:
-                for _ in range(30):
-                    if handle.status().has_metadata: break
-                    time.sleep(1)
-            
-            if not handle.status().has_metadata:
-                 dl.fail("Metadata timeout")
-                 self._on_task_terminated(dl)
-                 return
-
-            # 5. Map Segments to Pieces
-            info = handle.get_torrent_info()
-            piece_length = info.piece_length()
-            total_pieces = info.num_pieces()
-            
-            my_pieces = set()
-            for seg in dl.segments:
-                start_p = int((seg.start_byte + getattr(dl, 'torrent_file_offset', 0)) // piece_length)
-                end_p = int((seg.end_byte + getattr(dl, 'torrent_file_offset', 0)) // piece_length)
-                end_p = min(end_p, total_pieces - 1)
-                for p in range(start_p, end_p + 1):
-                    my_pieces.add(p)
-            
-            # 6. Register Interest
-            controller.register_interest(handle, dl.id, list(my_pieces))
-            
-            # 7. Start Monitoring
-            with self._lock:
-                dl.state = DownloadState.DOWNLOADING
-                dl.current_stage = "split-downloading"
-                dl.error_message = None
-                self.repository.save(dl)
-                self._active_downloads[dl.id] = dl
-                
-                cancel_event = threading.Event()
-                self._cancel_events[dl.id] = cancel_event
-
-            # Monitor Loop
-            threading.Thread(
-                target=self._monitor_shared_torrent,
-                args=(dl, controller, handle, list(my_pieces), cancel_event),
-                daemon=True
-            ).start()
-            
+            # Since shared_torrent functionality was removed, fall back to regular torrent download
+            print(f"[SplitTorrent] Warning: Shared torrent functionality removed, falling back to regular download for {dl.id}")
+            self._start_workers(dl)
         except Exception as e:
             print(f"[SplitTorrent] Start Error: {e}")
             dl.fail(f"Split Start Failed: {e}")
             self._on_task_terminated(dl)
 
-    def _monitor_shared_torrent(self, dl: Download, controller, handle, pieces: list, cancel_event: threading.Event):
-        """Monitor progress of specific pieces."""
-        try:
-            # Setup segments folder for marker files
-            folder = self._get_download_folder(dl)
-            segments_dir = folder / "segments"
-            segments_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Track which segments we've marked as done
-            marked_done = set()
-            
-            while not cancel_event.is_set():
-                if dl.state != DownloadState.DOWNLOADING: break
-                
-                # Get Stats for OUR pieces only
-                stats = controller.get_stats(handle, pieces)
-                
-                # Update Progress
-                dl._manual_progress = stats['progress']
-                
-                # UPDATE: Reflect verified bytes in downloaded_bytes for TUI accuracy
-                if stats.get('verified_bytes'):
-                    v_bytes = stats['verified_bytes']
-                    for seg in dl.segments:
-                        seg_size = seg.end_byte - seg.start_byte + 1
-                        seg.downloaded_bytes = min(v_bytes, seg_size)
-                        v_bytes -= seg.downloaded_bytes
-                
-                if not dl.total_size and stats.get('total_bytes'):
-                    dl.total_size = stats['total_bytes']
 
-                dl.current_stage = f"downloading ({stats['peers']} peers)"
-                dl.speed_bps = stats['speed'] 
-                
-                self.repository.save(dl)
-                
-                # Update marker files for each segment
-                for i, seg in enumerate(dl.segments):
-                    part_num = seg.part_number or (i + 1)
-                    done_file = segments_dir / f"{part_num:03d}.done"
-                    missing_file = segments_dir / f"{part_num:03d}.missing"
-                    
-                    # Check if this segment's pieces are all complete
-                    # Map segment to pieces (same logic as in _start_torrent_split_download)
-                    info = handle.get_torrent_info()
-                    piece_length = info.piece_length()
-                    
-                    start_p = int((seg.start_byte + getattr(dl, 'torrent_file_offset', 0)) // piece_length)
-                    end_p = int((seg.end_byte + getattr(dl, 'torrent_file_offset', 0)) // piece_length)
-                    seg_pieces = list(range(start_p, end_p + 1))
-                    
-                    # Check if all pieces for this segment are done
-                    all_done = all(controller.get_piece_status(handle, p) for p in seg_pieces)
-                    
-                    if all_done and part_num not in marked_done:
-                        # Mark as done
-                        if missing_file.exists():
-                            missing_file.unlink()
-                        done_file.touch()
-                        marked_done.add(part_num)
-                        # print(f"[Monitor] Marked segment {part_num} as DONE")
-                    elif not all_done and not missing_file.exists() and not done_file.exists():
-                        # Mark as missing
-                        missing_file.touch()
-                
-                if stats['done'] >= stats['total']:
-                    dl.complete()
-                    self.repository.save(dl)
-                    break
-                
-                # DEBUG: Print progress update
-                # print(f"[Monitor] Task {dl.id[:8]} - Progress: {stats['progress']:.1f}%, Speed: {stats['speed']/1024:.1f} KB/s")
-                
-                time.sleep(5.0)  # Update every 5 seconds as requested
-        except Exception as e:
-            print(f"[Monitor] Error: {e}")
-            import traceback
-            traceback.print_exc()
-            dl.fail(str(e))
-        finally:
-            # Deregister interest on stop/complete
-            controller.deregister_interest(handle, dl.id)
-            self._on_task_terminated(dl)
 
     def _import_v2(self, manifest, parts_filter, separate, creation_id, manifest_path):
         """Handle V2 workspace imports with context detection.

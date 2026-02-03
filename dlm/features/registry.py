@@ -23,19 +23,7 @@ FEATURES = [
         is_core=True,
         category="Core System"
     ),
-    Feature(
-        id="share",
-        name="LAN Share",
-        description="Keyboard-first local file sharing TUI",
-        dependencies=[
-            FASTAPI,
-            UVICORN,
-            PipDependency("zeroconf"),
-            PipDependency("qrcode"),
-            PipDependency("prompt_toolkit")
-        ],
-        category="Tools"
-    ),
+
     Feature(
         id="social",
         name="Social Media Support",
@@ -78,6 +66,21 @@ FEATURES = [
         description="Capture links from anti-bot sites",
         dependencies=[
             PipDependency("playwright")
+        ],
+        category="Tools"
+    ),
+    Feature(
+        id="share",
+        name="Share - Local Network",
+        description="Share files on local network (LAN)",
+        dependencies=[
+            PipDependency("textual"),
+            FASTAPI,
+            UVICORN,
+            PipDependency("zeroconf"),
+            PipDependency("netifaces"), # Better than socket
+            PipDependency("qrcode"),
+            PipDependency("psutil")
         ],
         category="Tools"
     )

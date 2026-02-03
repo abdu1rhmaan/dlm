@@ -695,61 +695,43 @@ class DLMShell(cmd.Cmd):
             run_feature_manager()
         except Exception as e:
             print(f"Error launching feature manager: {e}")
-            
+
     def do_share(self, arg):
         """
-        Share files on LAN.
-        Usage: 
-          share                     -> Open Interactive TUI (Scan/Create Room)
-          share send [path]         -> Direct send file/folder
-          share receive             -> Wait for incoming files (join room)
-          share join [ip:port] [tk] -> Join specific room
-          share room create         -> Start a room directly
+        Open the DLM Share interface for local network file sharing.
+        Usage: share [--room ROOM_NAME] [--add-file PATH] [--add-folder PATH]
         """
         import shlex
-        from dlm.share.cli import handle_share_command
+        args = shlex.split(arg) if arg else []
         
-        # Mock args to mimic argparse
-        class MockArgs:
-            def __init__(self, action=None, path=None, ip=None, port=None, token=None, save_to=None):
-                self.share_action = action
-                self.file_path = path
-                self.ip = ip
-                self.port = port
-                self.token = token
-                self.save_to = save_to
-                self.room_action = None
-
-        parts = shlex.split(arg)
-        action = parts[0] if parts else None
-        args = MockArgs(action=action)
+        # Parse arguments
+        room_name = "default"
+        add_file = None
+        add_folder = None
         
-        if action == 'send' and len(parts) > 1:
-            args.file_path = parts[1]
-        elif action in ('receive', 'join'):
-            if len(parts) > 1:
-                addr = parts[1]
-                if ':' in addr:
-                    args.ip, p_str = addr.split(':')
-                    try: args.port = int(p_str)
-                    except: pass
-                else: args.ip = addr
-            if len(parts) > 2:
-                args.token = parts[2]
-        elif action == 'room' and len(parts) > 1:
-            args.room_action = parts[1]
-
-        if '-save-to' in parts:
-            try:
-                idx = parts.index('-save-to')
-                if idx + 1 < len(parts):
-                    args.save_to = parts[idx+1]
-            except: pass
-
+        i = 0
+        while i < len(args):
+            if args[i] in ['-r', '--room'] and i + 1 < len(args):
+                room_name = args[i + 1]
+                i += 2
+            elif args[i] == '--add-file' and i + 1 < len(args):
+                add_file = args[i + 1]
+                i += 2
+            elif args[i] == '--add-folder' and i + 1 < len(args):
+                add_folder = args[i + 1]
+                i += 2
+            else:
+                i += 1
+        
         try:
-            handle_share_command(args, self.bus)
+            from dlm.share.cli import main as share_main
+            share_main(room_name=room_name, add_file=add_file, add_folder=add_folder)
         except Exception as e:
-            print(f"Error executing share command: {e}")
+            print(f"Error launching share: {e}")
+            import traceback
+            traceback.print_exc()
+            
+
 
     def _get_uuid_by_index(self, index_arg):
         try:

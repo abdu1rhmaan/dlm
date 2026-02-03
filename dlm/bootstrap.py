@@ -621,7 +621,7 @@ def create_container() -> dict:
         # Check repository first
         d = repo.get(cmd.id)
         
-        # If not in repo, check ephemeral memory (for share downloads)
+        # If not in repo, check ephemeral memory
         if not d and hasattr(service, '_ephemeral_memory'):
             d = service._ephemeral_memory.get(cmd.id)
         
@@ -675,7 +675,7 @@ def create_container() -> dict:
     bus.register(MoveTask, handle_move_task)
     bus.register(DeleteFolder, handle_delete_folder)
     
-    # Inject bus into service for share download progress updates
+    # Inject bus into service for download progress updates
     service.bus = bus
 
     return {

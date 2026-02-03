@@ -18,11 +18,12 @@ CORE_DEPS = [
 
 # --- OPTIONAL FEATURE DEPENDENCIES ---
 # Users install these via Feature Manager (dlm launcher)
-
 SHARE_DEPS = [
+    "textual",
     "fastapi",
     "uvicorn",
     "zeroconf",
+    "netifaces",
     "qrcode",
     "psutil",
 ]
@@ -63,7 +64,7 @@ setup(
         "spotify": SPOTIFY_DEPS,
         "torrent": TORRENT_DEPS,
         "vocals": VOCALS_DEPS,
-        "all": SHARE_DEPS + SOCIAL_DEPS + SPOTIFY_DEPS + TORRENT_DEPS + VOCALS_DEPS,
+        "all": SOCIAL_DEPS + SPOTIFY_DEPS + TORRENT_DEPS + VOCALS_DEPS + SHARE_DEPS,
     },
     entry_points={
         "console_scripts": [
