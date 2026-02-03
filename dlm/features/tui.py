@@ -62,10 +62,9 @@ class FeatureManagerTUI:
         # Dialog (Float)
         self.dialog_control = FormattedTextControl(self._get_dialog_text)
         self.dialog_window = Frame(
+            Window(content=self.dialog_control, width=D(min=30, max=60), height=D(min=8, max=20)),
             title=lambda: self.dialog_title,
-            style="class:dialog",
-            width=D(min=30, max=60),
-            height=D(min=8, max=20)
+            style="class:dialog"
         )
         
         self.root_container = FloatContainer(
