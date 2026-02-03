@@ -90,7 +90,8 @@ class JoinScreen(Screen):
             room = event.button.room_data
             connected = await self.app.join_room(room['ip'], room['port'])
             if connected:
-                self.app.switch_mode("room")
+                await self.app.switch_mode("room")
+                self.app.get_screen("room").init_room_state()
             else:
                 self.query_one("#scan-status").update("CONNECTION FAILED!")
 

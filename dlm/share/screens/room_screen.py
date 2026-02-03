@@ -72,19 +72,29 @@ class RoomScreen(Screen):
 
     def on_mount(self) -> None:
         self.query_one("#item-add").focus()
-        
-        # Subscribe to network updates
+        self.init_room_state()
+
+    def init_room_state(self):
+        """Refresh room info and re-subscribe to events."""
+        # Subscribe to network updates (in case they were cleared)
         self.app.net.on_device_list_update = self.update_device_list
         
         # Initial Info Update
         ip = self.app.net.host_ip
         port = self.app.net.tcp_port
         room = self.app.net.room_name or "Connected"
-        self.query_one("#room-header").update(f"ROOM: {room}   [LAN: {ip}:{port}]")
+        
+        try:
+            self.query_one("#room-header").update(f"ROOM: {room}   [LAN: {ip}:{port}]")
+        except Exception:
+            pass # Node might not exist yet?
         
         # Initial List Trigger
         if self.app.net.connected_devices:
             self.update_device_list(self.app.net.connected_devices)
+        else:
+            # Clear list if empty
+            self.update_device_list([])
 
     def update_device_list(self, devices):
         """Update the middle text area with list of devices."""

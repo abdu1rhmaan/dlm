@@ -4,6 +4,7 @@ from prompt_toolkit.layout import Layout
 from prompt_toolkit.widgets import Frame, TextArea, Label, Box
 from prompt_toolkit.layout.containers import Window, HSplit, VSplit, FloatContainer, Float, WindowAlign, ConditionalContainer
 from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.dimension import Dimension as D
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.styles import Style
 from prompt_toolkit.filters import Condition
@@ -61,9 +62,10 @@ class FeatureManagerTUI:
         # Dialog (Float)
         self.dialog_control = FormattedTextControl(self._get_dialog_text)
         self.dialog_window = Frame(
-            Window(content=self.dialog_control, width=60, height=10),
             title=lambda: self.dialog_title,
-            style="class:dialog"
+            style="class:dialog",
+            width=D(min=30, max=60),
+            height=D(min=8, max=20)
         )
         
         self.root_container = FloatContainer(
